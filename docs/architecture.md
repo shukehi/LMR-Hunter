@@ -280,6 +280,7 @@ MVP 使用 `SQLite`。
 
 - `raw_liquidations`
 - `raw_trades`
+- `raw_klines`
 - `signals`
 - `shadow_orders`
 - `live_orders`
@@ -287,6 +288,11 @@ MVP 使用 `SQLite`。
 - `positions`
 - `risk_events`
 - `service_heartbeats`
+
+Observe Mode 优化阶段新增（已落地）：
+
+- `liquidation_episodes` — 连续冲击聚合（阶段 3）；`episode_id = "{symbol}_{start_event_ts}"` 可追溯到 `raw_liquidations`
+- `episode_outcomes` — episode 结束后 15 分钟的价格路径观测（阶段 4）；由 `outcome_processor` 后台异步回填
 
 启用深度增强后再增加：
 

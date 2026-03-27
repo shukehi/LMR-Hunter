@@ -1,0 +1,6 @@
+aiohttp>=3.9
+aiosqlite>=0.19
+orjson>=3.9
+python-dotenv>=1.0
+uvloop>=0.19
+websockets>=12.0

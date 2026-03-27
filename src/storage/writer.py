@@ -91,6 +91,9 @@ class DatabaseWriter:
         self._system_degraded            = False
         # 首次溢出时由 enqueue_trade（同步）设置，由 flush_trades（异步）处理
         self._needs_overflow_risk_event  = False
+        # BUG-5 修复：并发保护，防止 trade_flusher 与 _shutdown 同时执行 flush_trades
+        # 导致 executemany 并发、重复写入和计数膨胀
+        self._flushing: bool             = False
 
     # ── 属性 ──────────────────────────────────────────────────────────────────
 
@@ -183,6 +186,17 @@ class DatabaseWriter:
           6. 隔离文件也失败：永久丢失（lost），DEGRADED
           7. 任何真实样本损坏 → 立即进入 DEGRADED（进程内不恢复）
         """
+        # BUG-5 修复：并发保护（trade_flusher 每秒触发 vs _shutdown 的 drain 循环）
+        if self._flushing:
+            return 0
+        self._flushing = True
+        try:
+            return await self._flush_trades_inner()
+        finally:
+            self._flushing = False
+
+    async def _flush_trades_inner(self) -> int:
+        """flush_trades 的实际逻辑，由持有 _flushing 锁的调用者执行。"""
         # 1. 处理首次溢出的风控事件（同步检测、异步写入）
         if self._needs_overflow_risk_event:
             self._needs_overflow_risk_event = False

@@ -6,6 +6,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# BUG-19 修复：时间戳合理性边界
+# 下限：2020-01-01 00:00:00 UTC（ms），拒绝明显错误的历史值
+_TS_MIN_MS: int = 1_577_836_800_000
+# 未来容忍：允许交易所时钟比本地快最多 10 秒（正常 NTP 偏差范围之外即拒绝）
+_TS_FUTURE_TOLERANCE_MS: int = 10_000
+
+
+def _check_ts(field: str, event_ts: int, recv_ts: int) -> None:
+    """校验交易所时间戳合理性，不合法时抛 ValueError（由 _listen 计入 parse_errors）。"""
+    if event_ts <= 0:
+        raise ValueError(f"{field}={event_ts} 非正数")
+    if event_ts < _TS_MIN_MS:
+        raise ValueError(f"{field}={event_ts} 早于 2020-01-01，疑似数据异常")
+    if event_ts > recv_ts + _TS_FUTURE_TOLERANCE_MS:
+        raise ValueError(
+            f"{field}={event_ts} 比本地接收时间 {recv_ts} "
+            f"早了 {event_ts - recv_ts}ms，超出时钟容忍范围"
+        )
+
 
 @dataclass(slots=True)
 class Liquidation:
@@ -24,9 +43,11 @@ class Liquidation:
         o = data["o"]
         qty = float(o["q"])
         price = float(o["ap"]) or float(o["p"])
+        event_ts = int(data["E"])
+        _check_ts("Liquidation.event_ts", event_ts, recv_ts)
         return cls(
             recv_ts=recv_ts,
-            event_ts=int(data["E"]),
+            event_ts=event_ts,
             symbol=o["s"],
             side=o["S"],
             qty=qty,
@@ -48,9 +69,11 @@ class Trade:
 
     @classmethod
     def from_raw(cls, data: dict, recv_ts: int) -> Trade:
+        trade_ts = int(data["T"])
+        _check_ts("Trade.trade_ts", trade_ts, recv_ts)
         return cls(
             recv_ts=recv_ts,
-            trade_ts=int(data["T"]),
+            trade_ts=trade_ts,
             symbol=data["s"],
             price=float(data["p"]),
             qty=float(data["q"]),
@@ -69,9 +92,11 @@ class Depth:
 
     @classmethod
     def from_raw(cls, data: dict, recv_ts: int) -> Depth:
+        event_ts = int(data["E"])
+        _check_ts("Depth.event_ts", event_ts, recv_ts)
         return cls(
             recv_ts=recv_ts,
-            event_ts=int(data["E"]),
+            event_ts=event_ts,
             symbol=data["s"],
             bids=[(float(p), float(q)) for p, q in data["b"]],
             asks=[(float(p), float(q)) for p, q in data["a"]],
@@ -112,9 +137,11 @@ class Kline:
     @classmethod
     def from_raw(cls, data: dict, recv_ts: int) -> "Kline":
         k = data["k"]
+        open_ts = int(k["t"])
+        _check_ts("Kline.open_ts", open_ts, recv_ts)
         return cls(
             recv_ts=recv_ts,
-            open_ts=int(k["t"]),
+            open_ts=open_ts,
             close_ts=int(k["T"]),
             symbol=k["s"],
             open=float(k["o"]),
@@ -135,10 +162,12 @@ class Kline:
         - close_ts >= recv_ts → 当前开放 K 线（最后一根）
         不强制设为 True，避免将当前未收盘 K 线误标，污染 VWAP 计算。
         """
+        open_ts  = int(row[0])
         close_ts = int(row[6])
+        _check_ts("Kline.open_ts(rest)", open_ts, recv_ts)
         return cls(
             recv_ts=recv_ts,
-            open_ts=int(row[0]),
+            open_ts=open_ts,
             close_ts=close_ts,
             symbol=symbol,
             open=float(row[1]),

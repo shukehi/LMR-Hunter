@@ -83,6 +83,10 @@ class FeatureCalculator:
         # 保留足够长的历史以支持双窗口（当前 + 前一个）
         self._liq_events: deque[tuple[int, float]] = deque()
 
+        # BUG-9 修复：高水位标记，驱逐只基于见过的最大时间戳
+        # 防止乱序事件导致较小 now_ms 的调用错误驱逐仍需要的历史数据
+        self._max_liq_ts: int = 0
+
         # K 线队列：只保留最近 15 根已收盘 K 线
         self._klines: deque[Kline] = deque(maxlen=15)
 
@@ -197,8 +201,11 @@ class FeatureCalculator:
         current_start = now_ms - self._liq_window_ms
         prev_start    = now_ms - 2 * self._liq_window_ms
 
-        # 清除超出双窗口范围的旧数据
-        while self._liq_events and self._liq_events[0][0] < prev_start:
+        # BUG-9 修复：只在高水位时才驱逐，避免乱序事件的小 now_ms
+        # 把已经被更大时间戳驱逐的数据再次错误地"恢复需要"
+        self._max_liq_ts = max(self._max_liq_ts, now_ms)
+        evict_before = self._max_liq_ts - 2 * self._liq_window_ms
+        while self._liq_events and self._liq_events[0][0] < evict_before:
             self._liq_events.popleft()
 
         current_total = 0.0

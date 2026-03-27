@@ -74,15 +74,17 @@ async def on_liquidation(liq: Liquidation) -> None:
     if not is_signal_liq:
         return
 
-    snap = _calc.snapshot()
+    # 阶段 2：以强平事件的交易所时间戳为锚点，确保窗口计算与事件时间对齐
+    snap = _calc.snapshot_at(liq.event_ts)
     logger.info(
-        "[BTC强平] %.0f USDT | 窗口=%.0f | 加速率=%s | VWAP=%s | 价格=%s | 偏离=%s bps",
+        "[BTC强平] %.0f USDT | 窗口=%.0f | 加速率=%s | VWAP=%s | 价格=%s | 偏离=%s bps | 盘口延迟=%s",
         liq.notional,
         snap.liq_notional_window,
         f"{snap.liq_accel_ratio:.3f}" if snap.liq_accel_ratio is not None else "N/A",
         f"{snap.vwap_15m:.2f}"        if snap.vwap_15m is not None else "冷启动",
         f"{snap.mid_price:.2f}"       if snap.mid_price is not None else "N/A",
         f"{snap.deviation_bps:.1f}"   if snap.deviation_bps is not None else "N/A",
+        f"{snap.depth_staleness_ms}ms" if snap.depth_staleness_ms is not None else "N/A",
     )
 
     if snap.mid_price is not None:
@@ -106,7 +108,8 @@ async def on_trade(trade: Trade) -> None:
 
 async def on_depth(depth: Depth) -> None:
     assert _calc is not None
-    _calc.update_mid_price(depth.mid_price)
+    # 阶段 2：传入交易所事件时间戳，供偏离率计算时校验盘口新鲜度
+    _calc.update_mid_price(depth.mid_price, depth.event_ts)
 
 
 async def on_kline(kline: Kline) -> None:

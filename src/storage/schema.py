@@ -132,6 +132,28 @@ CREATE TABLE IF NOT EXISTS positions (
     status         TEXT    NOT NULL  -- OPEN | CLOSED
 );
 
+-- ── Episode 研究样本（阶段 3：一次连续冲击 = 一条研究样本）──────────────────────────
+
+CREATE TABLE IF NOT EXISTS liquidation_episodes (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    episode_id           TEXT    NOT NULL UNIQUE,  -- "{symbol}_{start_event_ts}"
+    symbol               TEXT    NOT NULL,
+    side                 TEXT    NOT NULL,          -- SELL | BUY
+    start_event_ts       INTEGER NOT NULL,          -- 首笔强平的交易所时间戳 (ms)
+    end_event_ts         INTEGER NOT NULL,          -- 末笔强平的交易所时间戳 (ms)
+    duration_ms          INTEGER NOT NULL,          -- end - start (ms)
+    liq_count            INTEGER NOT NULL,          -- episode 内强平笔数
+    liq_notional_total   REAL    NOT NULL,          -- 所有强平名义价值之和 (USDT)
+    liq_peak_window      REAL    NOT NULL,          -- episode 期间最高滚动窗口值 (USDT)
+    liq_accel_ratio_peak REAL,                      -- 最高加速率（NULL = 无数据）
+    min_mid_price        REAL,                      -- 盘口中间价最低值（最深跌点）
+    pre_event_vwap       REAL,                      -- 首笔强平时的 VWAP（事前基准）
+    max_deviation_bps    REAL,                      -- 最大负偏离 bps（最小值，通常为负）
+    created_at           INTEGER NOT NULL           -- episode 关闭时的本地时间戳 (ms)
+);
+CREATE INDEX IF NOT EXISTS idx_episodes_start  ON liquidation_episodes(start_event_ts);
+CREATE INDEX IF NOT EXISTS idx_episodes_symbol ON liquidation_episodes(symbol);
+
 -- ── 风控与运维 ─────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS risk_events (

@@ -24,6 +24,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from src.features.episode import LiquidationEpisode
 from src.gateway.models import Kline, Liquidation, Trade
 from src.utils.logger import setup_logger
 
@@ -70,6 +71,7 @@ class DatabaseWriter:
             "trades":       0,
             "klines":       0,
             "signals":      0,
+            "episodes":     0,
             "heartbeats":   0,
             "risk_events":  0,
             "errors":       0,
@@ -373,6 +375,54 @@ class DatabaseWriter:
         except Exception as e:
             self._write_counts["errors"] += 1
             logger.error("写入信号失败: %s", e)
+            return 0
+
+    # ── Episode（阶段 3）────────────────────────────────────────────────────────
+
+    async def write_episode(self, episode: LiquidationEpisode) -> int:
+        """
+        写入一条 episode 研究样本，返回新插入的 id（失败时返回 0）。
+
+        episode 是一次连续强平冲击的聚合摘要（阶段 3 的核心产物）。
+        通过 start_event_ts / end_event_ts + symbol + side 可回放原始强平序列。
+        """
+        try:
+            cursor = await self._conn.execute(
+                """
+                INSERT INTO liquidation_episodes
+                    (episode_id, symbol, side,
+                     start_event_ts, end_event_ts, duration_ms,
+                     liq_count, liq_notional_total, liq_peak_window,
+                     liq_accel_ratio_peak, min_mid_price,
+                     pre_event_vwap, max_deviation_bps, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    episode.episode_id,  episode.symbol,  episode.side,
+                    episode.start_event_ts, episode.end_event_ts, episode.duration_ms,
+                    episode.liq_count,   episode.liq_notional_total, episode.liq_peak_window,
+                    episode.liq_accel_ratio_peak, episode.min_mid_price,
+                    episode.pre_event_vwap, episode.max_deviation_bps,
+                    int(time.time() * 1000),
+                ),
+            )
+            await self._conn.commit()
+            self._write_counts["episodes"] += 1
+            logger.info(
+                "[Episode] %s | %d 笔 | 总量=%.0f USDT | 峰值窗口=%.0f | 持续=%dms | "
+                "最深=%.0f | 偏离=%s bps",
+                episode.episode_id,
+                episode.liq_count,
+                episode.liq_notional_total,
+                episode.liq_peak_window,
+                episode.duration_ms,
+                episode.min_mid_price or 0,
+                f"{episode.max_deviation_bps:.1f}" if episode.max_deviation_bps is not None else "N/A",
+            )
+            return cursor.lastrowid or 0
+        except Exception as e:
+            self._write_counts["errors"] += 1
+            logger.error("写入 episode 失败: %s | %s", e, episode.episode_id)
             return 0
 
     # ── 内部工具 ──────────────────────────────────────────────────────────────

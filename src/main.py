@@ -24,6 +24,7 @@ import uvloop
 from dotenv import load_dotenv
 
 from src.features.calculator import FeatureCalculator
+from src.features.episode import EpisodeBuilder
 from src.gateway.binance_ws import BinanceGateway
 from src.gateway.models import Depth, Kline, Liquidation, Trade
 from src.gateway.rest_client import fetch_klines
@@ -40,6 +41,11 @@ DB_PATH        = os.getenv("DB_PATH", "/opt/lmr-hunter/data/lmr.db")
 SYMBOL         = os.getenv("SYMBOL", "BTCUSDT")
 LIQ_WINDOW_SEC = int(os.getenv("LIQ_WINDOW_SEC", "5"))
 
+# Episode 模型配置
+EPISODE_GAP_SEC             = int(os.getenv("EPISODE_GAP_SEC", "30"))
+EPISODE_NOISE_THRESHOLD_USDT = float(os.getenv("EPISODE_NOISE_THRESHOLD_USDT", "50000"))
+EPISODE_MAX_DURATION_SEC    = int(os.getenv("EPISODE_MAX_DURATION_SEC", "300"))
+
 LIQ_SIGNAL_SYMBOL = os.getenv("LIQ_SIGNAL_SYMBOL", SYMBOL)
 LIQ_SIGNAL_SIDE   = os.getenv("LIQ_SIGNAL_SIDE", "SELL")
 
@@ -53,16 +59,17 @@ logger = setup_logger("main", level=LOG_LEVEL)
 
 # ── 全局状态 ──────────────────────────────────────────────────────────────────
 
-_writer:  DatabaseWriter    | None = None
-_calc:    FeatureCalculator | None = None
-_gateway: BinanceGateway    | None = None
-_alerter: AlertManager      | None = None
+_writer:          DatabaseWriter    | None = None
+_calc:            FeatureCalculator | None = None
+_gateway:         BinanceGateway    | None = None
+_alerter:         AlertManager      | None = None
+_episode_builder: EpisodeBuilder    | None = None
 
 
 # ── 回调函数 ──────────────────────────────────────────────────────────────────
 
 async def on_liquidation(liq: Liquidation) -> None:
-    """强平事件：写入 DB；仅 BTCUSDT SELL 方向计入特征窗口。"""
+    """强平事件：写入 DB；仅 BTCUSDT SELL 方向计入特征窗口与 episode 模型。"""
     if _writer is None or _calc is None:
         logger.error("on_liquidation: 组件未初始化，跳过事件 %s", liq)
         return
@@ -88,6 +95,22 @@ async def on_liquidation(liq: Liquidation) -> None:
         f"{snap.deviation_bps:.1f}"   if snap.deviation_bps is not None else "N/A",
         f"{snap.depth_staleness_ms}ms" if snap.depth_staleness_ms is not None else "N/A",
     )
+
+    # 阶段 3：喂入 episode 构建器，若有完整 episode 刚关闭则持久化
+    if _episode_builder is not None:
+        completed_ep = _episode_builder.feed(
+            event_ts            = liq.event_ts,
+            symbol              = liq.symbol,
+            side                = liq.side,
+            notional            = liq.notional,
+            liq_notional_window = snap.liq_notional_window,
+            liq_accel_ratio     = snap.liq_accel_ratio,
+            mid_price           = snap.mid_price,
+            deviation_bps       = snap.deviation_bps,
+            vwap_15m            = snap.vwap_15m,
+        )
+        if completed_ep is not None:
+            await _writer.write_episode(completed_ep)
 
     if snap.mid_price is not None:
         await _writer.write_signal(
@@ -201,7 +224,7 @@ async def stats_reporter(interval: int = 60) -> None:
 # ── 主函数 ────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    global _writer, _calc, _gateway, _alerter
+    global _writer, _calc, _gateway, _alerter, _episode_builder
 
     logger.info("LMR-Hunter 启动 | 模式=observe | symbol=%s", SYMBOL)
 
@@ -219,7 +242,18 @@ async def main() -> None:
         disconnect_timeout_sec=120,
     )
 
-    # 3. 通过 REST 拉取历史 K 线，预热 VWAP
+    # 3. 初始化 episode 构建器
+    _episode_builder = EpisodeBuilder(
+        gap_ms               = EPISODE_GAP_SEC * 1000,
+        noise_threshold_usdt = EPISODE_NOISE_THRESHOLD_USDT,
+        max_duration_ms      = EPISODE_MAX_DURATION_SEC * 1000,
+    )
+    logger.info(
+        "EpisodeBuilder 已初始化 | gap=%ds | 噪声门槛=%.0f USDT | 最大持续=%ds",
+        EPISODE_GAP_SEC, EPISODE_NOISE_THRESHOLD_USDT, EPISODE_MAX_DURATION_SEC,
+    )
+
+    # 4. 通过 REST 拉取历史 K 线，预热 VWAP
     logger.info("引导 K 线数据...")
     _calc = FeatureCalculator(liq_window_sec=LIQ_WINDOW_SEC)
     boot_klines = await fetch_klines(SYMBOL, limit=16)
@@ -235,7 +269,7 @@ async def main() -> None:
     else:
         logger.warning("K 线引导失败，VWAP 将在收到 15 根 K 线后可用")
 
-    # 4. 初始化网关（含断线/重连钩子）
+    # 5. 初始化网关（含断线/重连钩子）
     _gateway = BinanceGateway(
         on_liquidation=on_liquidation,
         on_trade=on_trade,
@@ -245,13 +279,19 @@ async def main() -> None:
         on_reconnect=on_gateway_reconnect,
     )
 
-    # 5. 注册优雅退出信号
+    # 6. 注册优雅退出信号
     loop = asyncio.get_running_loop()
 
     async def _shutdown(sig_name: str) -> None:
         logger.info("收到信号 %s，准备退出...", sig_name)
         if _gateway:
             await _gateway.stop()
+        # 关闭前将未完成的 episode 持久化（避免丢失最后一次冲击的研究样本）
+        if _episode_builder and _writer:
+            last_ep = _episode_builder.flush()
+            if last_ep is not None:
+                await _writer.write_episode(last_ep)
+                logger.info("退出前 flush episode: %s", last_ep.episode_id)
         if _writer:
             total_flushed = 0
             while _writer.trade_queue_size > 0:
@@ -270,7 +310,7 @@ async def main() -> None:
             lambda s=sig: asyncio.create_task(_shutdown(s.name)),
         )
 
-    # 6. 启动所有协程
+    # 7. 启动所有协程
     logger.info("所有组件已就绪，开始 Observe Mode...")
     results = await asyncio.gather(
         _gateway.start(),

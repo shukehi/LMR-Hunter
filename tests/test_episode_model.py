@@ -103,24 +103,32 @@ def test_gap_separates_into_two_episodes():
 
 
 def test_max_duration_closes_episode():
-    """episode 超过 max_duration_ms 时自动关闭，关闭后开始新 episode。"""
-    builder = EpisodeBuilder(
-        gap_ms           = 30_000,
-        noise_threshold_usdt = 50_000,
-        max_duration_ms  = 60_000,     # 60 秒
-    )
-    _feed(builder, offset=0)           # t=0
-    _feed(builder, offset=30_000)      # t=30s（duration=30s < 60s，不触发）
-    closed = _feed(builder, offset=70_000)  # t=70s（duration=70s > 60s → 关闭旧 episode）
-    assert closed is not None
-    assert closed.start_event_ts == BASE_TS
-    assert closed.end_event_ts   == BASE_TS + 30_000   # 末笔是 t=30s
-    assert closed.duration_ms    == 30_000
+    """
+    episode 总持续 >= max_duration_ms 时自动关闭，关闭后开始新 episode。
 
-    # 新 episode 已从 t=70s 开始
+    使用 20s 间隔（< gap_ms=30s），避免 gap 条件抢先触发，
+    只让 duration 条件生效：t=0 + t=20s + t=40s → duration=40s < 60s；
+    t=60s → duration=60s >= 60s → 关闭旧 episode（包含前 3 笔），新 episode 从 t=60s 开始。
+    """
+    builder = EpisodeBuilder(
+        gap_ms               = 30_000,
+        noise_threshold_usdt = 50_000,
+        max_duration_ms      = 60_000,   # 60 秒
+    )
+    _feed(builder, offset=0)             # t=0: episode 开始
+    _feed(builder, offset=20_000)        # t=20s: gap=20s < 30s, duration=20s < 60s → 无关闭
+    _feed(builder, offset=40_000)        # t=40s: gap=20s < 30s, duration=40s < 60s → 无关闭
+    closed = _feed(builder, offset=60_000)  # t=60s: gap=20s < 30s, duration=60s >= 60s → 关闭！
+    assert closed is not None, "duration=60s 应触发 episode 关闭"
+    assert closed.start_event_ts == BASE_TS
+    assert closed.end_event_ts   == BASE_TS + 40_000   # 末笔是 t=40s（t=60s 已进入新 episode）
+    assert closed.duration_ms    == 40_000
+    assert closed.liq_count      == 3
+
+    # 新 episode 从 t=60s 开始
     remaining = builder.flush()
     assert remaining is not None
-    assert remaining.start_event_ts == BASE_TS + 70_000
+    assert remaining.start_event_ts == BASE_TS + 60_000
     assert remaining.liq_count == 1
 
 

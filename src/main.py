@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 
 from src.features.calculator import FeatureCalculator
 from src.features.episode import EpisodeBuilder
+from src.features.outcome import compute_outcome
 from src.gateway.binance_ws import BinanceGateway
 from src.gateway.models import Depth, Kline, Liquidation, Trade
 from src.gateway.rest_client import fetch_klines
@@ -45,6 +46,10 @@ LIQ_WINDOW_SEC = int(os.getenv("LIQ_WINDOW_SEC", "5"))
 EPISODE_GAP_SEC             = int(os.getenv("EPISODE_GAP_SEC", "30"))
 EPISODE_NOISE_THRESHOLD_USDT = float(os.getenv("EPISODE_NOISE_THRESHOLD_USDT", "50000"))
 EPISODE_MAX_DURATION_SEC    = int(os.getenv("EPISODE_MAX_DURATION_SEC", "300"))
+
+# Outcome 计算配置
+OUTCOME_WINDOW_MS  = 15 * 60_000                                    # 观测窗口：15 分钟
+OUTCOME_CHECK_SEC  = int(os.getenv("OUTCOME_CHECK_SEC", "60"))      # 后台检查间隔
 
 LIQ_SIGNAL_SYMBOL = os.getenv("LIQ_SIGNAL_SYMBOL", SYMBOL)
 LIQ_SIGNAL_SIDE   = os.getenv("LIQ_SIGNAL_SIDE", "SELL")
@@ -221,6 +226,39 @@ async def stats_reporter(interval: int = 60) -> None:
             await _alerter.check_all(s, lat, wc)
 
 
+async def outcome_processor() -> None:
+    """
+    后台任务：每 OUTCOME_CHECK_SEC 秒检查一次，为已完成的 episode 回填 outcome 记录。
+
+    Episode 结束后至少 15 分钟（OUTCOME_WINDOW_MS）才计算 outcome，
+    以确保 raw_trades 表中已有完整的价格路径数据。
+    """
+    await asyncio.sleep(OUTCOME_CHECK_SEC)  # 首次延迟，避免启动时立即扫描
+    while True:
+        try:
+            if _writer is not None:
+                pending = await _writer.get_episodes_pending_outcome(
+                    min_age_ms=OUTCOME_WINDOW_MS
+                )
+                for ep in pending:
+                    trades = await _writer.get_trades_after_episode(
+                        symbol   = ep["symbol"],
+                        start_ts = ep["end_event_ts"],
+                        end_ts   = ep["end_event_ts"] + OUTCOME_WINDOW_MS,
+                    )
+                    outcome = compute_outcome(
+                        episode_id     = ep["episode_id"],
+                        end_event_ts   = ep["end_event_ts"],
+                        entry_price    = ep["min_mid_price"],
+                        pre_event_vwap = ep["pre_event_vwap"],
+                        trades         = trades,
+                    )
+                    await _writer.write_episode_outcome(outcome)
+        except Exception as e:
+            logger.error("outcome_processor 错误: %s", e)
+        await asyncio.sleep(OUTCOME_CHECK_SEC)
+
+
 # ── 主函数 ────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -316,11 +354,12 @@ async def main() -> None:
         _gateway.start(),
         trade_flusher(),
         stats_reporter(),
+        outcome_processor(),
         return_exceptions=True,
     )
 
     # 检查是否有协程异常退出（return_exceptions=True 会吞掉异常，需手动检查）
-    task_names = ["gateway", "trade_flusher", "stats_reporter"]
+    task_names = ["gateway", "trade_flusher", "stats_reporter", "outcome_processor"]
     for name, result in zip(task_names, results):
         if isinstance(result, Exception):
             logger.critical("协程 %s 异常退出: %s", name, result, exc_info=result)

@@ -25,6 +25,7 @@ from pathlib import Path
 import aiosqlite
 
 from src.features.episode import LiquidationEpisode
+from src.features.outcome import EpisodeOutcome
 from src.gateway.models import Kline, Liquidation, Trade
 from src.utils.logger import setup_logger
 
@@ -72,6 +73,7 @@ class DatabaseWriter:
             "klines":       0,
             "signals":      0,
             "episodes":     0,
+            "outcomes":     0,
             "heartbeats":   0,
             "risk_events":  0,
             "errors":       0,
@@ -424,6 +426,96 @@ class DatabaseWriter:
             self._write_counts["errors"] += 1
             logger.error("写入 episode 失败: %s | %s", e, episode.episode_id)
             return 0
+
+    # ── Episode Outcome（阶段 4）──────────────────────────────────────────────────
+
+    async def get_episodes_pending_outcome(
+        self, min_age_ms: int = 15 * 60_000
+    ) -> list[dict]:
+        """
+        返回尚无 outcome 记录、且 end_event_ts 距今已超过 min_age_ms 的 episode 列表。
+
+        使用 LEFT JOIN 而非 NOT IN，避免子查询在大表上的全扫描。
+        """
+        cutoff = int(time.time() * 1000) - min_age_ms
+        rows = await (await self._conn.execute(
+            """
+            SELECT e.episode_id, e.end_event_ts, e.min_mid_price, e.pre_event_vwap, e.symbol
+            FROM   liquidation_episodes e
+            LEFT   JOIN episode_outcomes o ON e.episode_id = o.episode_id
+            WHERE  o.episode_id IS NULL
+              AND  e.end_event_ts < ?
+            ORDER  BY e.end_event_ts
+            """,
+            (cutoff,),
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_trades_after_episode(
+        self, symbol: str, start_ts: int, end_ts: int
+    ) -> list[tuple[int, float]]:
+        """
+        返回指定时间窗口内的成交序列 [(trade_ts, price), ...]，按 trade_ts 升序。
+
+        供 outcome_processor 查询 episode 结束后 15 分钟内的价格路径。
+        """
+        rows = await (await self._conn.execute(
+            """
+            SELECT trade_ts, price FROM raw_trades
+            WHERE  symbol = ? AND trade_ts BETWEEN ? AND ?
+            ORDER  BY trade_ts
+            """,
+            (symbol, start_ts, end_ts),
+        )).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    async def write_episode_outcome(self, outcome: EpisodeOutcome) -> None:
+        """
+        写入 episode outcome 记录（使用 INSERT OR IGNORE 避免重复写入）。
+
+        outcome 由 outcome_processor 在 episode 结束 15 分钟后异步回填。
+        """
+        try:
+            await self._conn.execute(
+                """
+                INSERT OR IGNORE INTO episode_outcomes
+                    (episode_id, entry_price,
+                     price_at_1m, price_at_5m, price_at_15m,
+                     min_price_0_5m, max_price_0_5m,
+                     min_price_0_15m, max_price_0_15m,
+                     mae_bps, mfe_bps,
+                     rebound_to_vwap_ms, rebound_depth_bps,
+                     trade_count_0_15m, computed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    outcome.episode_id,    outcome.entry_price,
+                    outcome.price_at_1m,   outcome.price_at_5m,  outcome.price_at_15m,
+                    outcome.min_price_0_5m, outcome.max_price_0_5m,
+                    outcome.min_price_0_15m, outcome.max_price_0_15m,
+                    outcome.mae_bps,       outcome.mfe_bps,
+                    outcome.rebound_to_vwap_ms, outcome.rebound_depth_bps,
+                    outcome.trade_count_0_15m,
+                    int(time.time() * 1000),
+                ),
+            )
+            await self._conn.commit()
+            self._write_counts["outcomes"] += 1
+            rebound_str = (
+                f"{outcome.rebound_to_vwap_ms // 1000}s"
+                if outcome.rebound_to_vwap_ms is not None else "未反弹"
+            )
+            logger.info(
+                "[Outcome] %s | MAE=%s bps | MFE=%s bps | 反弹到VWAP=%s | 成交=%d笔",
+                outcome.episode_id,
+                f"{outcome.mae_bps:.1f}" if outcome.mae_bps is not None else "N/A",
+                f"{outcome.mfe_bps:.1f}" if outcome.mfe_bps is not None else "N/A",
+                rebound_str,
+                outcome.trade_count_0_15m,
+            )
+        except Exception as e:
+            self._write_counts["errors"] += 1
+            logger.error("写入 outcome 失败: %s | %s", e, outcome.episode_id)
 
     # ── 内部工具 ──────────────────────────────────────────────────────────────
 

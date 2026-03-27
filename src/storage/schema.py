@@ -154,6 +154,28 @@ CREATE TABLE IF NOT EXISTS liquidation_episodes (
 CREATE INDEX IF NOT EXISTS idx_episodes_start  ON liquidation_episodes(start_event_ts);
 CREATE INDEX IF NOT EXISTS idx_episodes_symbol ON liquidation_episodes(symbol);
 
+-- ── Episode Outcome（阶段 4：episode 结束后 15 分钟的修复机制观测）──────────────────
+
+CREATE TABLE IF NOT EXISTS episode_outcomes (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    episode_id           TEXT    NOT NULL UNIQUE REFERENCES liquidation_episodes(episode_id),
+    entry_price          REAL,            -- 理论入场价 = episode.min_mid_price
+    price_at_1m          REAL,            -- episode 结束后 1 分钟的价格快照
+    price_at_5m          REAL,            -- episode 结束后 5 分钟的价格快照
+    price_at_15m         REAL,            -- episode 结束后 15 分钟的价格快照
+    min_price_0_5m       REAL,            -- 0-5 分钟最低价（MAE 来源）
+    max_price_0_5m       REAL,            -- 0-5 分钟最高价（MFE 来源）
+    min_price_0_15m      REAL,            -- 0-15 分钟最低价
+    max_price_0_15m      REAL,            -- 0-15 分钟最高价
+    mae_bps              REAL,            -- 最大不利偏移 bps（负值 = 入场后价格进一步下跌）
+    mfe_bps              REAL,            -- 最大有利偏移 bps（正值 = 入场后价格上涨空间）
+    rebound_to_vwap_ms   INTEGER,         -- 价格首次 >= pre_event_vwap 的延迟 (ms)；NULL=未反弹
+    rebound_depth_bps    REAL,            -- 从 entry 到 pre_event_vwap 的距离 (bps)
+    trade_count_0_15m    INTEGER NOT NULL DEFAULT 0,  -- 15 分钟内成交笔数（数据密度参考）
+    computed_at          INTEGER NOT NULL  -- outcome 计算时的本地时间戳 (ms)
+);
+CREATE INDEX IF NOT EXISTS idx_outcomes_episode ON episode_outcomes(episode_id);
+
 -- ── 风控与运维 ─────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS risk_events (

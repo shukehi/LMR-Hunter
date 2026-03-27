@@ -118,7 +118,12 @@ class FeatureCalculator:
 
         阶段 2：必须传入 depth 的交易所事件时间戳（event_ts），
         而非本地收到时间，以便后续计算偏离率时校验新鲜度。
+
+        防护：空盘口（bids/asks 为空）会导致 mid_price=0.0，
+        0.0 不是有效价格，拒绝更新以避免 deviation_bps=-10000bps 污染研究数据。
         """
+        if mid_price <= 0:
+            return
         self._mid_price    = mid_price
         self._mid_price_ts = event_ts
 

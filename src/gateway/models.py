@@ -127,16 +127,24 @@ class Kline:
 
     @classmethod
     def from_rest(cls, row: list, symbol: str, recv_ts: int) -> "Kline":
-        """从 REST API 返回的 K 线数组构建（冷启动引导用）。"""
+        """
+        从 REST API 返回的 K 线数组构建（冷启动引导用）。
+
+        is_closed 由 close_ts vs recv_ts 推断：
+        - close_ts < recv_ts → 已收盘（过去的 K 线）
+        - close_ts >= recv_ts → 当前开放 K 线（最后一根）
+        不强制设为 True，避免将当前未收盘 K 线误标，污染 VWAP 计算。
+        """
+        close_ts = int(row[6])
         return cls(
             recv_ts=recv_ts,
             open_ts=int(row[0]),
-            close_ts=int(row[6]),
+            close_ts=close_ts,
             symbol=symbol,
             open=float(row[1]),
             high=float(row[2]),
             low=float(row[3]),
             close=float(row[4]),
             volume=float(row[5]),
-            is_closed=True,
+            is_closed=close_ts < recv_ts,
         )

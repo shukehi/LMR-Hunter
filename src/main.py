@@ -63,7 +63,9 @@ _alerter: AlertManager      | None = None
 
 async def on_liquidation(liq: Liquidation) -> None:
     """强平事件：写入 DB；仅 BTCUSDT SELL 方向计入特征窗口。"""
-    assert _writer is not None and _calc is not None
+    if _writer is None or _calc is None:
+        logger.error("on_liquidation: 组件未初始化，跳过事件 %s", liq)
+        return
 
     await _writer.write_liquidation(liq)
 
@@ -102,18 +104,21 @@ async def on_liquidation(liq: Liquidation) -> None:
 
 
 async def on_trade(trade: Trade) -> None:
-    assert _writer is not None
+    if _writer is None:
+        return
     _writer.enqueue_trade(trade)
 
 
 async def on_depth(depth: Depth) -> None:
-    assert _calc is not None
+    if _calc is None:
+        return
     # 阶段 2：传入交易所事件时间戳，供偏离率计算时校验盘口新鲜度
     _calc.update_mid_price(depth.mid_price, depth.event_ts)
 
 
 async def on_kline(kline: Kline) -> None:
-    assert _writer is not None and _calc is not None
+    if _writer is None or _calc is None:
+        return
     _calc.on_kline(kline)
     await _writer.write_kline(kline)
 
@@ -171,18 +176,9 @@ async def stats_reporter(interval: int = 60) -> None:
             "DEGRADED" if _writer.is_degraded else "OK",
         )
 
-        # DEGRADED 状态触发告警
+        # DEGRADED 状态触发告警（通过 AlertManager 公开接口，附带 10 分钟防抖）
         if _writer.is_degraded and _alerter:
-            from src.monitor.alerts import AlertLevel
-            await _alerter._send(
-                key="storage_degraded",
-                level=AlertLevel.CRITICAL,
-                title="存储层 DEGRADED",
-                body=(
-                    f"批量写入持续失败，已丢弃 {intg['discarded']} 条成交样本。"
-                    f"研究数据已不完整，请检查磁盘和 SQLite 文件。"
-                ),
-            )
+            await _alerter.on_storage_degraded(intg["discarded"])
 
         status = "DEGRADED" if _writer.is_degraded else "OK"
         await _writer.write_heartbeat(
@@ -276,12 +272,18 @@ async def main() -> None:
 
     # 6. 启动所有协程
     logger.info("所有组件已就绪，开始 Observe Mode...")
-    await asyncio.gather(
+    results = await asyncio.gather(
         _gateway.start(),
         trade_flusher(),
         stats_reporter(),
         return_exceptions=True,
     )
+
+    # 检查是否有协程异常退出（return_exceptions=True 会吞掉异常，需手动检查）
+    task_names = ["gateway", "trade_flusher", "stats_reporter"]
+    for name, result in zip(task_names, results):
+        if isinstance(result, Exception):
+            logger.critical("协程 %s 异常退出: %s", name, result, exc_info=result)
 
     logger.info("LMR-Hunter 已退出")
 

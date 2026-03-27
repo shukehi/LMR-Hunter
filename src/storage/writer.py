@@ -31,7 +31,7 @@ logger = setup_logger("storage.writer")
 
 # 批量写入重试配置
 _MAX_RETRIES    = 3
-_RETRY_BACKOFF  = [0.5, 1.0, 2.0]   # 每次重试前等待秒数
+_RETRY_BACKOFF  = [0.5, 1.0]         # 每次重试前等待秒数（_MAX_RETRIES=3 次尝试，2 次退避）
 _FAIL_THRESHOLD = 3                   # 连续失败超过此次数 → DEGRADED
 
 # 隔离文件路径（写库彻底失败时的最后防线）
@@ -48,7 +48,10 @@ class DatabaseWriter:
         isolation_dir: Path = _ISOLATION_DIR,
     ) -> None:
         self._conn            = conn
-        self._trade_queue:    deque[Trade] = deque()
+        # maxlen 防止 DEGRADED 期间内存无限增长（BTC aggTrades 峰值 ~2000/min）
+        # 10_000 条约 10MB，提供 5 分钟缓冲；超出时最旧数据被静默丢弃
+        _QUEUE_MAXLEN         = 10_000
+        self._trade_queue:    deque[Trade] = deque(maxlen=_QUEUE_MAXLEN)
         self._trade_batch_size = trade_batch_size
         self._isolation_dir   = isolation_dir
 
@@ -57,7 +60,8 @@ class DatabaseWriter:
             "enqueued":    0,   # 入队总笔数
             "written":     0,   # 成功写库笔数
             "retried":     0,   # 重试次数（一次 flush 多次重试算多次）
-            "discarded":   0,   # 最终丢弃笔数（写入隔离文件）
+            "discarded":   0,   # 写入隔离文件的笔数（可追溯）
+            "lost":        0,   # 隔离文件也失败的笔数（永久丢失）
         }
 
         # ── 原有写入计数 ─────────────────────────────────────────────────────
@@ -119,9 +123,18 @@ class DatabaseWriter:
     # ── 成交数据（批量 + 完整性保证）────────────────────────────────────────────
 
     def enqueue_trade(self, trade: Trade) -> None:
-        """将成交放入内存队列，递增入队计数。"""
+        """将成交放入内存队列，递增入队计数。
+
+        队列设有 maxlen 上限（10_000）防止 OOM。超出时最旧数据被 deque 自动丢弃，
+        此时 enqueued > written + discarded，差值即为被回压丢弃的数量。
+        """
+        was_full = self._trade_queue.maxlen is not None and len(self._trade_queue) >= self._trade_queue.maxlen
         self._trade_queue.append(trade)
         self._integrity["enqueued"] += 1
+        if was_full:
+            # deque 的 maxlen 机制自动丢弃了最旧的元素
+            self._integrity["discarded"] += 1
+            logger.warning("成交队列已满（maxlen=%d），最旧样本被丢弃", self._trade_queue.maxlen)
 
     async def flush_trades(self) -> int:
         """
@@ -190,9 +203,10 @@ class DatabaseWriter:
             "批量写入彻底失败（%d 次重试），%d 条成交写入隔离文件: %s",
             _MAX_RETRIES, batch_size, last_exc,
         )
-        await self._write_isolation(batch_trades)
+        iso_ok = await self._write_isolation(batch_trades)
 
-        # 从队列移除（已隔离，不再重试）
+        # 从队列移除（无论隔离是否成功，均移除以防无限循环）
+        # iso_ok=False 时数据永久丢失，_integrity["lost"] 已累计，上方 logger.critical 已记录
         for _ in range(batch_size):
             self._trade_queue.popleft()
 
@@ -363,16 +377,19 @@ class DatabaseWriter:
 
     # ── 内部工具 ──────────────────────────────────────────────────────────────
 
-    async def _write_isolation(self, trades: list[Trade]) -> None:
+    async def _write_isolation(self, trades: list[Trade]) -> bool:
         """
         将无法写入 SQLite 的成交数据写入 JSONL 隔离文件。
         文件名包含时间戳，每次调用生成独立文件，避免并发写入冲突。
+
+        返回 True = 隔离成功；False = 隔离也失败（数据永久丢失）。
+
+        注意：文件写入使用 asyncio.to_thread() 避免阻塞事件循环。
         """
         try:
-            self._isolation_dir.mkdir(parents=True, exist_ok=True)
             ts_str   = time.strftime("%Y%m%d_%H%M%S")
             iso_path = self._isolation_dir / f"trades_{ts_str}_{len(trades)}.jsonl"
-            lines = [
+            content = "\n".join(
                 json.dumps({
                     "recv_ts":        t.recv_ts,
                     "trade_ts":       t.trade_ts,
@@ -382,15 +399,23 @@ class DatabaseWriter:
                     "is_buyer_maker": t.is_buyer_maker,
                 })
                 for t in trades
-            ]
-            iso_path.write_text("\n".join(lines), encoding="utf-8")
+            )
+
+            def _sync_write() -> None:
+                self._isolation_dir.mkdir(parents=True, exist_ok=True)
+                iso_path.write_text(content, encoding="utf-8")
+
+            await asyncio.to_thread(_sync_write)
             logger.warning("隔离文件已写入: %s (%d 条)", iso_path, len(trades))
+            return True
         except Exception as e:
-            # 隔离文件也写不了 → 只能记日志，无法再做什么
+            # 隔离文件也写不了 → 样本永久丢失，记录 CRITICAL
+            self._integrity["lost"] = self._integrity.get("lost", 0) + len(trades)
             logger.critical(
                 "隔离文件写入失败！%d 条成交数据永久丢失: %s",
                 len(trades), e,
             )
+            return False
 
     async def _mark_degraded(self) -> None:
         """将系统状态标记为 DEGRADED，写入 risk_events。"""

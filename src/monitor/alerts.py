@@ -118,6 +118,18 @@ class AlertManager:
             body=f"断线时长 {down_sec}s，已重新连接并恢复数据流。",
         )
 
+    async def on_storage_degraded(self, discarded: int) -> None:
+        """存储层进入 DEGRADED 状态时调用（带 10 分钟防抖）。"""
+        await self._send(
+            key="storage_degraded",
+            level=AlertLevel.CRITICAL,
+            title="存储层 DEGRADED",
+            body=(
+                f"批量写入持续失败，已丢弃 {discarded} 条成交样本。"
+                f"研究数据已不完整，请检查磁盘和 SQLite 文件。"
+            ),
+        )
+
     # ── 周期性检测（在 stats_reporter 中调用）─────────────────────────────────
 
     async def check_all(

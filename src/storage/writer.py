@@ -6,13 +6,21 @@
   - 成交数据（高频）：放入内存队列，由外部定时 flush 批量写入
   - K 线（低频）：UPSERT，用于 K 线更新期间覆盖未收盘 K 线
   - 心跳/风控：直接写入
-  - 所有写入失败记录日志，不抛出异常（避免中断主循环）
+
+数据完整性保证（阶段 1 优化）：
+  - flush_trades() 先复制 batch、成功后才从队列移除，失败不丢样本
+  - 写入失败自动重试（指数退避，最多 3 次）
+  - 全部重试失败后写入隔离文件，样本不静默丢失
+  - 完整性计数器：enqueued / written / retried / discarded
+  - 连续失败超阈值时写入 risk_events，状态升级为 DEGRADED
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections import deque
+from pathlib import Path
 
 import aiosqlite
 
@@ -21,23 +29,51 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger("storage.writer")
 
+# 批量写入重试配置
+_MAX_RETRIES    = 3
+_RETRY_BACKOFF  = [0.5, 1.0, 2.0]   # 每次重试前等待秒数
+_FAIL_THRESHOLD = 3                   # 连续失败超过此次数 → DEGRADED
+
+# 隔离文件路径（写库彻底失败时的最后防线）
+_ISOLATION_DIR = Path("/opt/lmr-hunter/data/isolation")
+
 
 class DatabaseWriter:
-    """封装所有对 SQLite 的写入操作。"""
+    """封装所有对 SQLite 的写入操作，提供数据完整性保证。"""
 
-    def __init__(self, conn: aiosqlite.Connection, trade_batch_size: int = 200) -> None:
-        self._conn = conn
-        self._trade_queue: deque[Trade] = deque()
+    def __init__(
+        self,
+        conn: aiosqlite.Connection,
+        trade_batch_size: int = 200,
+        isolation_dir: Path = _ISOLATION_DIR,
+    ) -> None:
+        self._conn            = conn
+        self._trade_queue:    deque[Trade] = deque()
         self._trade_batch_size = trade_batch_size
+        self._isolation_dir   = isolation_dir
+
+        # ── 完整性计数器 ──────────────────────────────────────────────────────
+        self._integrity = {
+            "enqueued":    0,   # 入队总笔数
+            "written":     0,   # 成功写库笔数
+            "retried":     0,   # 重试次数（一次 flush 多次重试算多次）
+            "discarded":   0,   # 最终丢弃笔数（写入隔离文件）
+        }
+
+        # ── 原有写入计数 ─────────────────────────────────────────────────────
         self._write_counts = {
             "liquidations": 0,
-            "trades": 0,
-            "klines": 0,
-            "signals": 0,
-            "heartbeats": 0,
-            "risk_events": 0,
-            "errors": 0,
+            "trades":       0,
+            "klines":       0,
+            "signals":      0,
+            "heartbeats":   0,
+            "risk_events":  0,
+            "errors":       0,
         }
+
+        # 连续失败计数（用于触发 DEGRADED）
+        self._consecutive_flush_failures = 0
+        self._system_degraded = False
 
     # ── 属性 ──────────────────────────────────────────────────────────────────
 
@@ -46,8 +82,20 @@ class DatabaseWriter:
         return dict(self._write_counts)
 
     @property
+    def integrity(self) -> dict[str, int]:
+        return dict(self._integrity)
+
+    @property
     def trade_queue_size(self) -> int:
         return len(self._trade_queue)
+
+    @property
+    def is_degraded(self) -> bool:
+        return self._system_degraded
+
+    def integrity_ok(self) -> bool:
+        """True = 没有样本被丢弃。Shadow Mode 前置门槛之一。"""
+        return self._integrity["discarded"] == 0
 
     # ── 强平事件 ──────────────────────────────────────────────────────────────
 
@@ -68,43 +116,91 @@ class DatabaseWriter:
             self._write_counts["errors"] += 1
             logger.error("写入强平事件失败: %s | %s", e, liq)
 
-    # ── 成交数据（批量）─────────────────────────────────────────────────────────
+    # ── 成交数据（批量 + 完整性保证）────────────────────────────────────────────
 
     def enqueue_trade(self, trade: Trade) -> None:
-        """将成交放入内存队列，不立即写库。"""
+        """将成交放入内存队列，递增入队计数。"""
         self._trade_queue.append(trade)
+        self._integrity["enqueued"] += 1
 
     async def flush_trades(self) -> int:
-        """将队列中的成交批量写入数据库，返回写入条数。"""
+        """
+        批量写入成交数据，返回本次成功写入的条数。
+
+        完整性保证：
+          1. 先复制 batch，不立即从队列移除
+          2. 写入成功后才移除队列头部对应数量
+          3. 失败时重试（指数退避，最多 3 次）
+          4. 全部重试失败：写入隔离文件，从队列移除（记为 discarded）
+          5. 连续失败超过阈值：标记系统 DEGRADED，写 risk_events
+        """
         if not self._trade_queue:
             return 0
 
-        batch = []
-        while self._trade_queue:
-            t = self._trade_queue.popleft()
-            batch.append((
-                t.recv_ts, t.trade_ts, t.symbol,
-                t.price, t.qty, int(t.is_buyer_maker),
-            ))
-            if len(batch) >= self._trade_batch_size:
-                break
+        # 1. 复制 batch（不出队）
+        batch_size = min(len(self._trade_queue), self._trade_batch_size)
+        batch_trades = [self._trade_queue[i] for i in range(batch_size)]
+        batch_rows = [
+            (t.recv_ts, t.trade_ts, t.symbol, t.price, t.qty, int(t.is_buyer_maker))
+            for t in batch_trades
+        ]
 
-        try:
-            await self._conn.executemany(
-                """
-                INSERT INTO raw_trades
-                    (recv_ts, trade_ts, symbol, price, qty, is_buyer_maker)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                batch,
-            )
-            await self._conn.commit()
-            self._write_counts["trades"] += len(batch)
-            return len(batch)
-        except Exception as e:
-            self._write_counts["errors"] += 1
-            logger.error("批量写入成交失败: %s | batch_size=%d", e, len(batch))
-            return 0
+        # 2. 带重试的写入
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                await self._conn.executemany(
+                    """
+                    INSERT INTO raw_trades
+                        (recv_ts, trade_ts, symbol, price, qty, is_buyer_maker)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    batch_rows,
+                )
+                await self._conn.commit()
+
+                # 3. 写入成功 → 从队列移除
+                for _ in range(batch_size):
+                    self._trade_queue.popleft()
+
+                self._write_counts["trades"]  += batch_size
+                self._integrity["written"]    += batch_size
+                self._consecutive_flush_failures = 0
+                if self._system_degraded:
+                    logger.info("写库恢复正常，清除 DEGRADED 状态")
+                    self._system_degraded = False
+                return batch_size
+
+            except Exception as e:
+                last_exc = e
+                if attempt < _MAX_RETRIES - 1:
+                    wait = _RETRY_BACKOFF[attempt]
+                    self._integrity["retried"] += 1
+                    logger.warning(
+                        "批量写入成交失败（第 %d/%d 次），%.1fs 后重试: %s",
+                        attempt + 1, _MAX_RETRIES, wait, e,
+                    )
+                    await asyncio.sleep(wait)
+
+        # 4. 全部重试失败 → 写隔离文件，从队列移除（discarded）
+        self._write_counts["errors"] += 1
+        self._integrity["discarded"] += batch_size
+        self._consecutive_flush_failures += 1
+        logger.error(
+            "批量写入彻底失败（%d 次重试），%d 条成交写入隔离文件: %s",
+            _MAX_RETRIES, batch_size, last_exc,
+        )
+        await self._write_isolation(batch_trades)
+
+        # 从队列移除（已隔离，不再重试）
+        for _ in range(batch_size):
+            self._trade_queue.popleft()
+
+        # 5. 连续失败超阈值 → DEGRADED
+        if self._consecutive_flush_failures >= _FAIL_THRESHOLD:
+            await self._mark_degraded()
+
+        return 0
 
     # ── K 线 ──────────────────────────────────────────────────────────────────
 
@@ -264,3 +360,53 @@ class DatabaseWriter:
             self._write_counts["errors"] += 1
             logger.error("写入信号失败: %s", e)
             return 0
+
+    # ── 内部工具 ──────────────────────────────────────────────────────────────
+
+    async def _write_isolation(self, trades: list[Trade]) -> None:
+        """
+        将无法写入 SQLite 的成交数据写入 JSONL 隔离文件。
+        文件名包含时间戳，每次调用生成独立文件，避免并发写入冲突。
+        """
+        try:
+            self._isolation_dir.mkdir(parents=True, exist_ok=True)
+            ts_str   = time.strftime("%Y%m%d_%H%M%S")
+            iso_path = self._isolation_dir / f"trades_{ts_str}_{len(trades)}.jsonl"
+            lines = [
+                json.dumps({
+                    "recv_ts":        t.recv_ts,
+                    "trade_ts":       t.trade_ts,
+                    "symbol":         t.symbol,
+                    "price":          t.price,
+                    "qty":            t.qty,
+                    "is_buyer_maker": t.is_buyer_maker,
+                })
+                for t in trades
+            ]
+            iso_path.write_text("\n".join(lines), encoding="utf-8")
+            logger.warning("隔离文件已写入: %s (%d 条)", iso_path, len(trades))
+        except Exception as e:
+            # 隔离文件也写不了 → 只能记日志，无法再做什么
+            logger.critical(
+                "隔离文件写入失败！%d 条成交数据永久丢失: %s",
+                len(trades), e,
+            )
+
+    async def _mark_degraded(self) -> None:
+        """将系统状态标记为 DEGRADED，写入 risk_events。"""
+        if self._system_degraded:
+            return
+        self._system_degraded = True
+        msg = (
+            f"批量写入连续失败 {self._consecutive_flush_failures} 次，"
+            f"已丢弃 {self._integrity['discarded']} 条成交样本。"
+            f"系统进入 DEGRADED 状态。"
+        )
+        logger.critical("DEGRADED: %s", msg)
+        await self.write_risk_event(
+            component="storage.writer",
+            event_type="WRITE_FAILURE_PERSISTENT",
+            severity="CRITICAL",
+            message=msg,
+            context=json.dumps(self._integrity),
+        )

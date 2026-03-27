@@ -145,9 +145,10 @@ async def stats_reporter(interval: int = 60) -> None:
         if not _gateway or not _writer:
             continue
 
-        s   = _gateway.stats
-        lat = _gateway.latency_percentiles()
-        wc  = _writer.counts
+        s    = _gateway.stats
+        lat  = _gateway.latency_percentiles()
+        wc   = _writer.counts
+        intg = _writer.integrity
 
         logger.info(
             "[统计] 消息=%d | 强平=%d | 成交=%d | K线=%d | 盘口=%d | "
@@ -160,10 +161,30 @@ async def stats_reporter(interval: int = 60) -> None:
             "[延迟] P50=%.1fms | P95=%.1fms | P99=%.1fms",
             lat["p50"] or 0, lat["p95"] or 0, lat["p99"] or 0,
         )
+        logger.info(
+            "[完整性] 入队=%d | 写库=%d | 重试=%d | 丢弃=%d | 状态=%s",
+            intg["enqueued"], intg["written"],
+            intg["retried"], intg["discarded"],
+            "DEGRADED" if _writer.is_degraded else "OK",
+        )
 
+        # DEGRADED 状态触发告警
+        if _writer.is_degraded and _alerter:
+            from src.monitor.alerts import AlertLevel
+            await _alerter._send(
+                key="storage_degraded",
+                level=AlertLevel.CRITICAL,
+                title="存储层 DEGRADED",
+                body=(
+                    f"批量写入持续失败，已丢弃 {intg['discarded']} 条成交样本。"
+                    f"研究数据已不完整，请检查磁盘和 SQLite 文件。"
+                ),
+            )
+
+        status = "DEGRADED" if _writer.is_degraded else "OK"
         await _writer.write_heartbeat(
             component="gateway",
-            status="OK",
+            status=status,
             msg_total=s["msg_total"],
             liq_count=s["liquidations"],
             trade_count=s["trades"],

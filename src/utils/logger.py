@@ -20,12 +20,15 @@ def setup_logger(name: str, log_dir: str = "/opt/lmr-hunter/logs", level: str = 
     console.setFormatter(fmt)
     logger.addHandler(console)
 
-    # 文件输出
-    log_path = Path(log_dir)
-    log_path.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(log_path / f"{name}.log", encoding="utf-8")
-    file_handler.setFormatter(fmt)
-    logger.addHandler(file_handler)
+    # 文件输出（目录不可写时降级为仅控制台，例如本地开发环境）
+    try:
+        log_path = Path(log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path / f"{name}.log", encoding="utf-8")
+        file_handler.setFormatter(fmt)
+        logger.addHandler(file_handler)
+    except (PermissionError, OSError):
+        pass
 
     logger.propagate = False
     return logger

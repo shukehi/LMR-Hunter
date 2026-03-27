@@ -78,6 +78,7 @@ class BinanceGateway:
         self._on_disconnect  = on_disconnect
         self._on_reconnect   = on_reconnect
         self._running        = False
+        self._ws             = None   # 当前 websocket 连接引用（用于主动关闭）
 
         # 消息计数
         self.stats: dict[str, int] = {
@@ -109,7 +110,8 @@ class BinanceGateway:
                     ping_timeout=10,
                     close_timeout=5,
                 ) as ws:
-                    backoff = _BACKOFF_INIT
+                    self._ws = ws
+                    backoff  = _BACKOFF_INIT
                     logger.info("WebSocket 已连接，开始接收数据")
                     if self._on_reconnect and self.stats["reconnects"] > 0:
                         await self._on_reconnect()
@@ -128,6 +130,9 @@ class BinanceGateway:
                 if self._on_disconnect:
                     await self._on_disconnect()
 
+            finally:
+                self._ws = None   # 连接关闭后清除引用
+
             if not self._running:
                 break
 
@@ -137,7 +142,17 @@ class BinanceGateway:
             backoff = min(backoff * _BACKOFF_FACTOR, _BACKOFF_MAX)
 
     async def stop(self) -> None:
+        """停止网关：先主动关闭当前 websocket，再清除运行标志。
+
+        主动关闭确保 _listen() 的 `async for` 迭代器立即退出，
+        而不是等到下一条消息到来才发现 _running=False。
+        """
         self._running = False
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass   # 已断线时 close() 可能抛出，忽略即可
         logger.info("网关已停止")
 
     def latency_percentiles(self) -> dict[str, float | None]:

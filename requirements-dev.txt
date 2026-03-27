@@ -1,0 +1,8 @@
+# 开发/测试依赖
+# 安装方式：python -m pip install -r requirements-dev.txt
+# 安装后直接运行：python -m pytest -q
+
+-r requirements.txt
+pytest>=8.0
+pytest-asyncio>=0.23
+-e .

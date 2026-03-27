@@ -7,12 +7,16 @@
   - K 线（低频）：UPSERT，用于 K 线更新期间覆盖未收盘 K 线
   - 心跳/风控：直接写入
 
-数据完整性保证（阶段 1 优化）：
+数据完整性保证（阶段 A 运行态优化）：
   - flush_trades() 先复制 batch、成功后才从队列移除，失败不丢样本
   - 写入失败自动重试（指数退避，最多 3 次）
-  - 全部重试失败后写入隔离文件，样本不静默丢失
-  - 完整性计数器：enqueued / written / retried / discarded
-  - 连续失败超阈值时写入 risk_events，状态升级为 DEGRADED
+  - 全部重试失败后写入隔离文件（isolated），样本不静默丢失
+  - 隔离文件也写失败 → 永久丢失（lost）
+  - 队列超出 maxlen → 最旧样本被 deque 自动覆盖（overflow_dropped）
+  - 完整性计数器：enqueued / written / retried / overflow_dropped / isolated / lost
+    其中 discarded = overflow_dropped + isolated + lost（向后兼容只读字段）
+  - 任何真实样本损坏（overflow_dropped/isolated/lost > 0）立即标记 DEGRADED
+  - DEGRADED 在进程生命周期内不自动恢复
 """
 from __future__ import annotations
 
@@ -34,7 +38,7 @@ logger = setup_logger("storage.writer")
 # 批量写入重试配置
 _MAX_RETRIES    = 3
 _RETRY_BACKOFF  = [0.5, 1.0]         # 每次重试前等待秒数（_MAX_RETRIES=3 次尝试，2 次退避）
-_FAIL_THRESHOLD = 3                   # 连续失败超过此次数 → DEGRADED
+_FAIL_THRESHOLD = 3                   # 连续失败超过此次数 → 额外 DEGRADED 保障
 
 # 隔离文件路径（写库彻底失败时的最后防线）
 _ISOLATION_DIR = Path("/opt/lmr-hunter/data/isolation")
@@ -46,27 +50,30 @@ class DatabaseWriter:
     def __init__(
         self,
         conn: aiosqlite.Connection,
-        trade_batch_size: int = 200,
-        isolation_dir: Path = _ISOLATION_DIR,
+        trade_batch_size: int  = 2000,
+        trade_queue_maxlen: int = 50_000,
+        isolation_dir: Path    = _ISOLATION_DIR,
     ) -> None:
-        self._conn            = conn
-        # maxlen 防止 DEGRADED 期间内存无限增长（BTC aggTrades 峰值 ~2000/min）
-        # 10_000 条约 10MB，提供 5 分钟缓冲；超出时最旧数据被静默丢弃
-        _QUEUE_MAXLEN         = 10_000
-        self._trade_queue:    deque[Trade] = deque(maxlen=_QUEUE_MAXLEN)
-        self._trade_batch_size = trade_batch_size
-        self._isolation_dir   = isolation_dir
+        self._conn               = conn
+        self._trade_queue:       deque[Trade] = deque(maxlen=trade_queue_maxlen)
+        self._trade_batch_size   = trade_batch_size
+        self._isolation_dir      = isolation_dir
 
-        # ── 完整性计数器 ──────────────────────────────────────────────────────
-        self._integrity = {
-            "enqueued":    0,   # 入队总笔数
-            "written":     0,   # 成功写库笔数
-            "retried":     0,   # 重试次数（一次 flush 多次重试算多次）
-            "discarded":   0,   # 写入隔离文件的笔数（可追溯）
-            "lost":        0,   # 隔离文件也失败的笔数（永久丢失）
+        # ── 完整性计数器 ──────────────────────────────────────────────────────────
+        # overflow_dropped : 队列溢出，最旧样本被 deque 自动覆盖（直接丢失）
+        # isolated         : DB 写入彻底失败，已写入隔离文件（可追溯）
+        # lost             : DB + 隔离文件均失败（永久丢失）
+        # discarded        : 只读计算字段 = overflow_dropped + isolated + lost
+        self._integrity: dict[str, int] = {
+            "enqueued":         0,
+            "written":          0,
+            "retried":          0,
+            "overflow_dropped": 0,
+            "isolated":         0,
+            "lost":             0,
         }
 
-        # ── 原有写入计数 ─────────────────────────────────────────────────────
+        # ── 原有写入计数 ─────────────────────────────────────────────────────────
         self._write_counts = {
             "liquidations": 0,
             "trades":       0,
@@ -79,9 +86,11 @@ class DatabaseWriter:
             "errors":       0,
         }
 
-        # 连续失败计数（用于触发 DEGRADED）
+        # 连续失败计数（作为 DEGRADED 的额外触发保障）
         self._consecutive_flush_failures = 0
-        self._system_degraded = False
+        self._system_degraded            = False
+        # 首次溢出时由 enqueue_trade（同步）设置，由 flush_trades（异步）处理
+        self._needs_overflow_risk_event  = False
 
     # ── 属性 ──────────────────────────────────────────────────────────────────
 
@@ -91,7 +100,10 @@ class DatabaseWriter:
 
     @property
     def integrity(self) -> dict[str, int]:
-        return dict(self._integrity)
+        """返回完整性计数字典，含向后兼容字段 discarded。"""
+        d = dict(self._integrity)
+        d["discarded"] = d["overflow_dropped"] + d["isolated"] + d["lost"]
+        return d
 
     @property
     def trade_queue_size(self) -> int:
@@ -102,8 +114,9 @@ class DatabaseWriter:
         return self._system_degraded
 
     def integrity_ok(self) -> bool:
-        """True = 没有样本被丢弃。Shadow Mode 前置门槛之一。"""
-        return self._integrity["discarded"] == 0
+        """True = 没有任何真实样本损坏。Shadow Mode 前置门槛之一。"""
+        i = self._integrity
+        return i["overflow_dropped"] == 0 and i["isolated"] == 0 and i["lost"] == 0
 
     # ── 强平事件 ──────────────────────────────────────────────────────────────
 
@@ -129,40 +142,69 @@ class DatabaseWriter:
     def enqueue_trade(self, trade: Trade) -> None:
         """将成交放入内存队列，递增入队计数。
 
-        队列设有 maxlen 上限（10_000）防止 OOM。超出时最旧数据被 deque 自动丢弃，
-        此时 enqueued > written + discarded，差值即为被回压丢弃的数量。
+        队列设有 maxlen 上限，超出时 deque 自动覆盖最旧样本（overflow_dropped）。
+        首次溢出时同步标记 _needs_overflow_risk_event，由下一次 flush_trades 写入
+        DEGRADED 风控事件（避免同步函数中调用 async 方法）。
         """
-        was_full = self._trade_queue.maxlen is not None and len(self._trade_queue) >= self._trade_queue.maxlen
+        was_full = (
+            self._trade_queue.maxlen is not None
+            and len(self._trade_queue) >= self._trade_queue.maxlen
+        )
         self._trade_queue.append(trade)
         self._integrity["enqueued"] += 1
+
         if was_full:
-            # deque 的 maxlen 机制自动丢弃了最旧的元素
-            self._integrity["discarded"] += 1
-            logger.warning("成交队列已满（maxlen=%d），最旧样本被丢弃", self._trade_queue.maxlen)
+            self._integrity["overflow_dropped"] += 1
+            if not self._system_degraded and not self._needs_overflow_risk_event:
+                # 首次溢出：设置标志，等下一次 flush_trades 异步写入 risk_event
+                self._needs_overflow_risk_event = True
+                logger.critical(
+                    "成交队列溢出开始！maxlen=%d | overflow_dropped=%d | "
+                    "系统将在下次 flush 时进入 DEGRADED",
+                    self._trade_queue.maxlen,
+                    self._integrity["overflow_dropped"],
+                )
+            else:
+                logger.warning(
+                    "成交队列持续溢出，累计 overflow_dropped=%d",
+                    self._integrity["overflow_dropped"],
+                )
 
     async def flush_trades(self) -> int:
         """
         批量写入成交数据，返回本次成功写入的条数。
 
         完整性保证：
-          1. 先复制 batch，不立即从队列移除
-          2. 写入成功后才移除队列头部对应数量
-          3. 失败时重试（指数退避，最多 3 次）
-          4. 全部重试失败：写入隔离文件，从队列移除（记为 discarded）
-          5. 连续失败超过阈值：标记系统 DEGRADED，写 risk_events
+          1. 检查并处理首次溢出风控事件
+          2. 先复制 batch，不立即从队列移除
+          3. 写入成功后才移除队列头部对应数量
+          4. 失败时重试（指数退避，最多 3 次）
+          5. 全部重试失败：写入隔离文件（isolated），从队列移除
+          6. 隔离文件也失败：永久丢失（lost），DEGRADED
+          7. 任何真实样本损坏 → 立即进入 DEGRADED（进程内不恢复）
         """
+        # 1. 处理首次溢出的风控事件（同步检测、异步写入）
+        if self._needs_overflow_risk_event:
+            self._needs_overflow_risk_event = False
+            await self._ensure_degraded(
+                f"成交队列溢出（maxlen={self._trade_queue.maxlen}，"
+                f"overflow_dropped={self._integrity['overflow_dropped']}），"
+                f"最旧样本已丢失，系统进入 DEGRADED",
+                context=json.dumps(self.integrity),
+            )
+
         if not self._trade_queue:
             return 0
 
-        # 1. 复制 batch（不出队）
-        batch_size = min(len(self._trade_queue), self._trade_batch_size)
+        # 2. 复制 batch（不出队）
+        batch_size   = min(len(self._trade_queue), self._trade_batch_size)
         batch_trades = [self._trade_queue[i] for i in range(batch_size)]
-        batch_rows = [
+        batch_rows   = [
             (t.recv_ts, t.trade_ts, t.symbol, t.price, t.qty, int(t.is_buyer_maker))
             for t in batch_trades
         ]
 
-        # 2. 带重试的写入
+        # 3. 带重试的写入
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES):
             try:
@@ -176,16 +218,14 @@ class DatabaseWriter:
                 )
                 await self._conn.commit()
 
-                # 3. 写入成功 → 从队列移除
+                # 写入成功 → 从队列移除
                 for _ in range(batch_size):
                     self._trade_queue.popleft()
 
-                self._write_counts["trades"]  += batch_size
-                self._integrity["written"]    += batch_size
+                self._write_counts["trades"] += batch_size
+                self._integrity["written"]   += batch_size
                 self._consecutive_flush_failures = 0
-                if self._system_degraded:
-                    logger.info("写库恢复正常，清除 DEGRADED 状态")
-                    self._system_degraded = False
+                # 注意：DEGRADED 一旦触发不在此处恢复
                 return batch_size
 
             except Exception as e:
@@ -199,24 +239,36 @@ class DatabaseWriter:
                     )
                     await asyncio.sleep(wait)
 
-        # 4. 全部重试失败 → 写隔离文件，从队列移除（discarded）
-        self._write_counts["errors"] += 1
-        self._integrity["discarded"] += batch_size
-        self._consecutive_flush_failures += 1
+        # 4. 全部重试失败 → 写隔离文件
+        self._write_counts["errors"]           += 1
+        self._consecutive_flush_failures       += 1
         logger.error(
-            "批量写入彻底失败（%d 次重试），%d 条成交写入隔离文件: %s",
+            "批量写入彻底失败（%d 次重试），%d 条成交尝试写入隔离文件: %s",
             _MAX_RETRIES, batch_size, last_exc,
         )
         iso_ok = await self._write_isolation(batch_trades)
 
+        if iso_ok:
+            self._integrity["isolated"] += batch_size
+        # iso_ok=False → _write_isolation 内部已增 self._integrity["lost"]
+
         # 从队列移除（无论隔离是否成功，均移除以防无限循环）
-        # iso_ok=False 时数据永久丢失，_integrity["lost"] 已累计，上方 logger.critical 已记录
         for _ in range(batch_size):
             self._trade_queue.popleft()
 
-        # 5. 连续失败超阈值 → DEGRADED
+        # 5. 任何真实样本损坏 → 立即 DEGRADED（幂等）
+        await self._ensure_degraded(
+            f"批量写入彻底失败，{batch_size} 条成交"
+            f"{'已写入隔离文件' if iso_ok else '永久丢失（隔离文件也失败）'}",
+            context=json.dumps(self.integrity),
+        )
+
+        # 6. 连续失败阈值保障（通常已由上方 _ensure_degraded 覆盖）
         if self._consecutive_flush_failures >= _FAIL_THRESHOLD:
-            await self._mark_degraded()
+            await self._ensure_degraded(
+                f"批量写入连续失败 {self._consecutive_flush_failures} 次",
+                context=json.dumps(self.integrity),
+            )
 
         return 0
 
@@ -384,9 +436,6 @@ class DatabaseWriter:
     async def write_episode(self, episode: LiquidationEpisode) -> int:
         """
         写入一条 episode 研究样本，返回新插入的 id（失败时返回 0）。
-
-        episode 是一次连续强平冲击的聚合摘要（阶段 3 的核心产物）。
-        通过 start_event_ts / end_event_ts + symbol + side 可回放原始强平序列。
         """
         try:
             cursor = await self._conn.execute(
@@ -432,11 +481,7 @@ class DatabaseWriter:
     async def get_episodes_pending_outcome(
         self, min_age_ms: int = 15 * 60_000
     ) -> list[dict]:
-        """
-        返回尚无 outcome 记录、且 end_event_ts 距今已超过 min_age_ms 的 episode 列表。
-
-        使用 LEFT JOIN 而非 NOT IN，避免子查询在大表上的全扫描。
-        """
+        """返回尚无 outcome 记录、且 end_event_ts 距今已超过 min_age_ms 的 episode 列表。"""
         cutoff = int(time.time() * 1000) - min_age_ms
         rows = await (await self._conn.execute(
             """
@@ -454,11 +499,7 @@ class DatabaseWriter:
     async def get_trades_after_episode(
         self, symbol: str, start_ts: int, end_ts: int
     ) -> list[tuple[int, float]]:
-        """
-        返回指定时间窗口内的成交序列 [(trade_ts, price), ...]，按 trade_ts 升序。
-
-        供 outcome_processor 查询 episode 结束后 15 分钟内的价格路径。
-        """
+        """返回指定时间窗口内的成交序列 [(trade_ts, price), ...]，按 trade_ts 升序。"""
         rows = await (await self._conn.execute(
             """
             SELECT trade_ts, price FROM raw_trades
@@ -470,11 +511,7 @@ class DatabaseWriter:
         return [(r[0], r[1]) for r in rows]
 
     async def write_episode_outcome(self, outcome: EpisodeOutcome) -> None:
-        """
-        写入 episode outcome 记录（使用 INSERT OR IGNORE 避免重复写入）。
-
-        outcome 由 outcome_processor 在 episode 结束 15 分钟后异步回填。
-        """
+        """写入 episode outcome 记录（使用 INSERT OR IGNORE 避免重复写入）。"""
         try:
             await self._conn.execute(
                 """
@@ -522,16 +559,12 @@ class DatabaseWriter:
     async def _write_isolation(self, trades: list[Trade]) -> bool:
         """
         将无法写入 SQLite 的成交数据写入 JSONL 隔离文件。
-        文件名包含时间戳，每次调用生成独立文件，避免并发写入冲突。
-
-        返回 True = 隔离成功；False = 隔离也失败（数据永久丢失）。
-
-        注意：文件写入使用 asyncio.to_thread() 避免阻塞事件循环。
+        返回 True = 隔离成功（isolated）；False = 隔离也失败（lost）。
         """
         try:
             ts_str   = time.strftime("%Y%m%d_%H%M%S")
             iso_path = self._isolation_dir / f"trades_{ts_str}_{len(trades)}.jsonl"
-            content = "\n".join(
+            content  = "\n".join(
                 json.dumps({
                     "recv_ts":        t.recv_ts,
                     "trade_ts":       t.trade_ts,
@@ -551,29 +584,25 @@ class DatabaseWriter:
             logger.warning("隔离文件已写入: %s (%d 条)", iso_path, len(trades))
             return True
         except Exception as e:
-            # 隔离文件也写不了 → 样本永久丢失，记录 CRITICAL
-            self._integrity["lost"] = self._integrity.get("lost", 0) + len(trades)
+            self._integrity["lost"] += len(trades)
             logger.critical(
                 "隔离文件写入失败！%d 条成交数据永久丢失: %s",
                 len(trades), e,
             )
             return False
 
-    async def _mark_degraded(self) -> None:
-        """将系统状态标记为 DEGRADED，写入 risk_events。"""
+    async def _ensure_degraded(
+        self, reason: str, context: str | None = None
+    ) -> None:
+        """将系统标记为 DEGRADED（幂等，进程生命周期内不可恢复）。"""
         if self._system_degraded:
             return
         self._system_degraded = True
-        msg = (
-            f"批量写入连续失败 {self._consecutive_flush_failures} 次，"
-            f"已丢弃 {self._integrity['discarded']} 条成交样本。"
-            f"系统进入 DEGRADED 状态。"
-        )
-        logger.critical("DEGRADED: %s", msg)
+        logger.critical("DEGRADED: %s", reason)
         await self.write_risk_event(
             component="storage.writer",
             event_type="WRITE_FAILURE_PERSISTENT",
             severity="CRITICAL",
-            message=msg,
-            context=json.dumps(self._integrity),
+            message=reason,
+            context=context,
         )

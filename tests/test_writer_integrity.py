@@ -143,8 +143,14 @@ class TestTradeIntegrity:
         assert "price" in first
 
     @pytest.mark.asyncio
-    async def test_degraded_after_consecutive_failures(self, tmp_path):
-        """连续失败超过阈值（3 次）系统标记 DEGRADED 并写 risk_events。"""
+    async def test_degraded_after_db_failure(self, tmp_path):
+        """
+        任何真实样本损坏（isolated > 0）都应立即标记 DEGRADED 并写 risk_events。
+
+        新语义（阶段 A）：DEGRADED 在首次 isolated/lost/overflow_dropped > 0 时立即触发，
+        不再等待连续失败累计到阈值。
+        discarded（向后兼容）= overflow_dropped + isolated + lost。
+        """
         import aiosqlite
         conn = MagicMock(spec=aiosqlite.Connection)
         # executemany 总是失败，但 execute（用于写 risk_events）成功
@@ -156,10 +162,10 @@ class TestTradeIntegrity:
         writer  = DatabaseWriter(conn, trade_batch_size=1, isolation_dir=iso_dir)
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
-            # 触发 3 次连续失败
             for _ in range(3):
                 writer.enqueue_trade(make_trade())
                 await writer.flush_trades()
 
         assert writer.is_degraded is True
+        # discarded = isolated（DB 失败 → 已写隔离文件）= 3
         assert writer.integrity["discarded"] == 3

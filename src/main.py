@@ -1,7 +1,7 @@
 """
 LMR-Hunter 主入口。
 
-当前阶段：Observe Mode（阶段 1）
+当前阶段：Observe Mode
 
 数据流：
     Binance WS → BinanceGateway
@@ -11,14 +11,17 @@ LMR-Hunter 主入口。
                    └─ on_kline       → FeatureCalculator + DatabaseWriter
 
 后台任务：
-    - trade_flusher   每 5 秒将成交队列批量写入 SQLite
-    - stats_reporter  每 60 秒打印统计摘要 + 写入心跳 + 运行告警检测
+    - trade_flusher    每 TRADE_FLUSH_INTERVAL_SEC 秒排空成交队列
+    - stats_reporter   每 60 秒打印统计摘要 + 写入心跳 + 运行告警检测
+    - outcome_processor 每 OUTCOME_CHECK_SEC 秒回填 episode outcome
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
+import time
 
 import uvloop
 from dotenv import load_dotenv
@@ -43,20 +46,26 @@ SYMBOL         = os.getenv("SYMBOL", "BTCUSDT")
 LIQ_WINDOW_SEC = int(os.getenv("LIQ_WINDOW_SEC", "5"))
 
 # Episode 模型配置
-EPISODE_GAP_SEC             = int(os.getenv("EPISODE_GAP_SEC", "30"))
+EPISODE_GAP_SEC              = int(os.getenv("EPISODE_GAP_SEC", "30"))
 EPISODE_NOISE_THRESHOLD_USDT = float(os.getenv("EPISODE_NOISE_THRESHOLD_USDT", "50000"))
-EPISODE_MAX_DURATION_SEC    = int(os.getenv("EPISODE_MAX_DURATION_SEC", "300"))
+EPISODE_MAX_DURATION_SEC     = int(os.getenv("EPISODE_MAX_DURATION_SEC", "300"))
 
 # Outcome 计算配置
-OUTCOME_WINDOW_MS  = 15 * 60_000                                    # 观测窗口：15 分钟
-OUTCOME_CHECK_SEC  = int(os.getenv("OUTCOME_CHECK_SEC", "60"))      # 后台检查间隔
+OUTCOME_WINDOW_MS = 15 * 60_000
+OUTCOME_CHECK_SEC = int(os.getenv("OUTCOME_CHECK_SEC", "60"))
+
+# 成交队列与吞吐配置（阶段 A 运行态优化）
+TRADE_BATCH_SIZE             = int(os.getenv("TRADE_BATCH_SIZE", "2000"))
+TRADE_FLUSH_INTERVAL_SEC     = float(os.getenv("TRADE_FLUSH_INTERVAL_SEC", "1"))
+TRADE_QUEUE_MAXLEN           = int(os.getenv("TRADE_QUEUE_MAXLEN", "50000"))
+TRADE_FLUSH_MAX_BATCHES_PER_TICK = int(os.getenv("TRADE_FLUSH_MAX_BATCHES_PER_TICK", "20"))
 
 LIQ_SIGNAL_SYMBOL = os.getenv("LIQ_SIGNAL_SYMBOL", SYMBOL)
 LIQ_SIGNAL_SIDE   = os.getenv("LIQ_SIGNAL_SIDE", "SELL")
 
 # 告警配置（可选）
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID")
 LATENCY_P95_ALERT_MS = float(os.getenv("LATENCY_P95_ALERT_MS", "400"))
 
 logger = setup_logger("main", level=LOG_LEVEL)
@@ -88,7 +97,6 @@ async def on_liquidation(liq: Liquidation) -> None:
     if not is_signal_liq:
         return
 
-    # 阶段 2：以强平事件的交易所时间戳为锚点，确保窗口计算与事件时间对齐
     snap = _calc.snapshot_at(liq.event_ts)
     logger.info(
         "[BTC强平] %.0f USDT | 窗口=%.0f | 加速率=%s | VWAP=%s | 价格=%s | 偏离=%s bps | 盘口延迟=%s",
@@ -101,7 +109,6 @@ async def on_liquidation(liq: Liquidation) -> None:
         f"{snap.depth_staleness_ms}ms" if snap.depth_staleness_ms is not None else "N/A",
     )
 
-    # 阶段 3：喂入 episode 构建器，若有完整 episode 刚关闭则持久化
     if _episode_builder is not None:
         completed_ep = _episode_builder.feed(
             event_ts            = liq.event_ts,
@@ -140,7 +147,6 @@ async def on_trade(trade: Trade) -> None:
 async def on_depth(depth: Depth) -> None:
     if _calc is None:
         return
-    # 阶段 2：传入交易所事件时间戳，供偏离率计算时校验盘口新鲜度
     _calc.update_mid_price(depth.mid_price, depth.event_ts)
 
 
@@ -165,13 +171,53 @@ async def on_gateway_reconnect() -> None:
 
 # ── 后台任务 ──────────────────────────────────────────────────────────────────
 
-async def trade_flusher(interval: float = 5.0) -> None:
+async def trade_flusher(
+    interval: float = TRADE_FLUSH_INTERVAL_SEC,
+    max_batches: int = TRADE_FLUSH_MAX_BATCHES_PER_TICK,
+) -> None:
+    """
+    每 interval 秒排空成交队列，单轮最多执行 max_batches 次 flush。
+
+    若达到单轮上限后队列仍非空（QUEUE_BACKLOG），记录警告但不触发 DEGRADED：
+    backlog 本身是回压信号，真正的样本损坏由 overflow_dropped/isolated/lost 反映。
+    """
+    last_backlog_warn_ts = 0.0
+
     while True:
         await asyncio.sleep(interval)
-        if _writer:
+        if _writer is None:
+            continue
+
+        batches_done = 0
+        while _writer.trade_queue_size > 0 and batches_done < max_batches:
             flushed = await _writer.flush_trades()
-            if flushed:
-                logger.debug("成交批量写入 %d 条", flushed)
+            batches_done += 1
+            if flushed == 0:
+                break   # 写入失败，停止本轮继续重试（避免死循环）
+
+        # 达到单轮上限后队列仍有积压 → QUEUE_BACKLOG 警告（60s 防抖）
+        if _writer.trade_queue_size > 0:
+            now = time.monotonic()
+            if now - last_backlog_warn_ts >= 60.0:
+                last_backlog_warn_ts = now
+                queue_size = _writer.trade_queue_size
+                logger.warning(
+                    "QUEUE_BACKLOG: 成交队列仍有 %d 条未写入"
+                    "（已达单轮上限 %d 批 × %d 条 = %d 条/tick）",
+                    queue_size, max_batches, TRADE_BATCH_SIZE,
+                    max_batches * TRADE_BATCH_SIZE,
+                )
+                await _writer.write_risk_event(
+                    component="storage.writer",
+                    event_type="QUEUE_BACKLOG",
+                    severity="WARN",
+                    message=f"成交队列回压 {queue_size} 条，超过单轮排空能力",
+                    context=json.dumps({
+                        "trade_queue_size":      queue_size,
+                        "max_batches_per_tick":  max_batches,
+                        "trade_batch_size":      TRADE_BATCH_SIZE,
+                    }),
+                )
 
 
 async def stats_reporter(interval: int = 60) -> None:
@@ -198,15 +244,25 @@ async def stats_reporter(interval: int = 60) -> None:
             lat["p50"] or 0, lat["p95"] or 0, lat["p99"] or 0,
         )
         logger.info(
-            "[完整性] 入队=%d | 写库=%d | 重试=%d | 丢弃=%d | 状态=%s",
-            intg["enqueued"], intg["written"],
-            intg["retried"], intg["discarded"],
+            "[完整性] 入队=%d | 写库=%d | 重试=%d | "
+            "溢出丢弃=%d | 隔离=%d | 永久丢失=%d | 队列积压=%d | 状态=%s",
+            intg["enqueued"], intg["written"], intg["retried"],
+            intg["overflow_dropped"], intg["isolated"], intg["lost"],
+            _writer.trade_queue_size,
             "DEGRADED" if _writer.is_degraded else "OK",
         )
 
-        # DEGRADED 状态触发告警（通过 AlertManager 公开接口，附带 10 分钟防抖）
         if _writer.is_degraded and _alerter:
             await _alerter.on_storage_degraded(intg["discarded"])
+
+        # 心跳 notes 包含研究可用性相关字段
+        notes = json.dumps({
+            "trade_queue_size": _writer.trade_queue_size,
+            "overflow_dropped": intg["overflow_dropped"],
+            "isolated":         intg["isolated"],
+            "lost":             intg["lost"],
+            "episode_stats":    _episode_builder.stats if _episode_builder else {},
+        })
 
         status = "DEGRADED" if _writer.is_degraded else "OK"
         await _writer.write_heartbeat(
@@ -219,9 +275,9 @@ async def stats_reporter(interval: int = 60) -> None:
             latency_p95=lat["p95"],
             latency_p99=lat["p99"],
             reconnects=s["reconnects"],
+            notes=notes,
         )
 
-        # 告警检测
         if _alerter:
             await _alerter.check_all(s, lat, wc)
 
@@ -229,11 +285,8 @@ async def stats_reporter(interval: int = 60) -> None:
 async def outcome_processor() -> None:
     """
     后台任务：每 OUTCOME_CHECK_SEC 秒检查一次，为已完成的 episode 回填 outcome 记录。
-
-    Episode 结束后至少 15 分钟（OUTCOME_WINDOW_MS）才计算 outcome，
-    以确保 raw_trades 表中已有完整的价格路径数据。
     """
-    await asyncio.sleep(OUTCOME_CHECK_SEC)  # 首次延迟，避免启动时立即扫描
+    await asyncio.sleep(OUTCOME_CHECK_SEC)
     while True:
         try:
             if _writer is not None:
@@ -265,11 +318,20 @@ async def main() -> None:
     global _writer, _calc, _gateway, _alerter, _episode_builder
 
     logger.info("LMR-Hunter 启动 | 模式=observe | symbol=%s", SYMBOL)
+    logger.info(
+        "成交队列配置 | batch=%d | interval=%.1fs | maxlen=%d | max_batches=%d",
+        TRADE_BATCH_SIZE, TRADE_FLUSH_INTERVAL_SEC,
+        TRADE_QUEUE_MAXLEN, TRADE_FLUSH_MAX_BATCHES_PER_TICK,
+    )
 
     # 1. 初始化数据库
     logger.info("初始化数据库: %s", DB_PATH)
     conn = await init_db(DB_PATH)
-    _writer = DatabaseWriter(conn)
+    _writer = DatabaseWriter(
+        conn,
+        trade_batch_size   = TRADE_BATCH_SIZE,
+        trade_queue_maxlen = TRADE_QUEUE_MAXLEN,
+    )
 
     # 2. 初始化告警管理器
     _alerter = AlertManager(
@@ -307,7 +369,7 @@ async def main() -> None:
     else:
         logger.warning("K 线引导失败，VWAP 将在收到 15 根 K 线后可用")
 
-    # 5. 初始化网关（含断线/重连钩子）
+    # 5. 初始化网关
     _gateway = BinanceGateway(
         on_liquidation=on_liquidation,
         on_trade=on_trade,
@@ -317,19 +379,53 @@ async def main() -> None:
         on_reconnect=on_gateway_reconnect,
     )
 
-    # 6. 注册优雅退出信号
+    # 6. 创建后台任务（显式管理，供停机时 cancel）
     loop = asyncio.get_running_loop()
 
+    flusher_task  = asyncio.create_task(
+        trade_flusher(TRADE_FLUSH_INTERVAL_SEC, TRADE_FLUSH_MAX_BATCHES_PER_TICK),
+        name="trade_flusher",
+    )
+    reporter_task = asyncio.create_task(stats_reporter(), name="stats_reporter")
+    outcome_task  = asyncio.create_task(outcome_processor(), name="outcome_processor")
+    gateway_task  = asyncio.create_task(_gateway.start(), name="gateway")
+
+    bg_tasks = [flusher_task, reporter_task, outcome_task]
+    _shutting_down = False
+
+    # 7. 停机处理（闭包捕获任务引用）
     async def _shutdown(sig_name: str) -> None:
-        logger.info("收到信号 %s，准备退出...", sig_name)
+        nonlocal _shutting_down
+        if _shutting_down:
+            return
+        _shutting_down = True
+        logger.info("收到信号 %s，开始有序退出...", sig_name)
+
+        # 步骤 1：停止网关（主动关闭 websocket，不再接收新数据）
         if _gateway:
             await _gateway.stop()
-        # 关闭前将未完成的 episode 持久化（避免丢失最后一次冲击的研究样本）
+
+        # 步骤 2：取消周期性后台任务
+        for task in bg_tasks:
+            task.cancel()
+        await asyncio.gather(*bg_tasks, return_exceptions=True)
+        logger.info("后台任务已取消")
+
+        # 步骤 3：取消 gateway 任务（stop() 应已触发退出，此处兜底）
+        gateway_task.cancel()
+        try:
+            await gateway_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+        # 步骤 4：flush active episode
         if _episode_builder and _writer:
             last_ep = _episode_builder.flush()
             if last_ep is not None:
                 await _writer.write_episode(last_ep)
                 logger.info("退出前 flush episode: %s", last_ep.episode_id)
+
+        # 步骤 5：drain trade queue
         if _writer:
             total_flushed = 0
             while _writer.trade_queue_size > 0:
@@ -337,10 +433,15 @@ async def main() -> None:
                 total_flushed += n
                 if n == 0:
                     break
-            logger.info("退出前 flush %d 条成交", total_flushed)
+            logger.info("退出前 flush %d 条成交（队列剩余=%d）",
+                        total_flushed, _writer.trade_queue_size)
+
+        # 步骤 6：关闭数据库
         if conn:
             await conn.close()
             logger.info("数据库连接已关闭")
+
+        logger.info("LMR-Hunter 有序退出完成")
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(
@@ -348,20 +449,14 @@ async def main() -> None:
             lambda s=sig: asyncio.create_task(_shutdown(s.name)),
         )
 
-    # 7. 启动所有协程
+    # 8. 等待所有任务完成（停机时任务逐一 cancel/return）
     logger.info("所有组件已就绪，开始 Observe Mode...")
-    results = await asyncio.gather(
-        _gateway.start(),
-        trade_flusher(),
-        stats_reporter(),
-        outcome_processor(),
-        return_exceptions=True,
-    )
+    all_tasks   = [gateway_task, flusher_task, reporter_task, outcome_task]
+    task_names  = ["gateway", "trade_flusher", "stats_reporter", "outcome_processor"]
+    results     = await asyncio.gather(*all_tasks, return_exceptions=True)
 
-    # 检查是否有协程异常退出（return_exceptions=True 会吞掉异常，需手动检查）
-    task_names = ["gateway", "trade_flusher", "stats_reporter", "outcome_processor"]
     for name, result in zip(task_names, results):
-        if isinstance(result, Exception):
+        if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
             logger.critical("协程 %s 异常退出: %s", name, result, exc_info=result)
 
     logger.info("LMR-Hunter 已退出")

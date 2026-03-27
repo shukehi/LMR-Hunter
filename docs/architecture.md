@@ -6,9 +6,13 @@
 
 本文件回答的是“系统如何实现”。
 
+当前阶段状态以 [项目状态](status.md) 为准；术语、时间语义和状态语义以 [术语表](glossary.md) 为准。
+
 ## 2. 运行模式
 
 系统分为四种运行模式：
+
+运行模式名称的统一语义见 [术语表](glossary.md)；本节主要说明各模式在架构上的职责差异。
 
 ### 2.1 Observe Mode
 
@@ -158,6 +162,8 @@ All Modules -> Persistence Layer -> Replay / Metrics / Audit
 ## 6. 状态机
 
 系统的状态至少分为两层：
+
+具体状态含义以 [术语表](glossary.md) 为准；本节只定义系统必须实现的状态层级和状态机约束。
 
 主运行状态：
 
@@ -514,6 +520,9 @@ lmr-hunter/
 
 这些内容分别放在：
 
+- [文档地图](index.md)
+- [项目状态](status.md)
+- [术语表](glossary.md)
 - [策略文档](strategy.md)
 - [风控文档](risk-controls.md)
 - [开发计划](development-plan.md)

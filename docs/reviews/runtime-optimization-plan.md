@@ -10,7 +10,9 @@
 - 哪些问题会直接污染 episode/outcome 结论
 - 应该先修什么、冻结什么、如何验证修复已经生效
 
-本文件与 [`docs/optimization-plan.md`](./optimization-plan.md) 的关系如下：
+本文件是 2026-03-27 的运行态审查记录，不替代 [策略文档](../strategy.md)、[术语表](../glossary.md)、[架构文档](../architecture.md)、[风控文档](../risk-controls.md)、[开发计划](../development-plan.md) 和 [项目状态](../status.md) 这些长期规范文档。
+
+本文件与 [`reviews/optimization-plan.md`](./optimization-plan.md) 的关系如下：
 
 - `optimization-plan.md` 记录的是第一轮结构性优化路线
 - 本文档记录的是 2026-03-27 运行态复盘后必须执行的第二轮修复计划

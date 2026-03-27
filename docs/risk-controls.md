@@ -6,6 +6,8 @@
 
 本文件回答的是“什么情况下不应该做，以及如何把错误成本限制住”。
 
+当前阶段状态以 [项目状态](status.md) 为准；术语、时间语义和状态语义以 [术语表](glossary.md) 为准。
+
 ## 2. 风控目标
 
 LMR-Hunter 的风控目标不是消灭亏损，而是限制错误事件的破坏范围。
@@ -24,6 +26,8 @@ LMR-Hunter 的风控目标不是消灭亏损，而是限制错误事件的破坏
 1. 账户级风险
 2. 策略级风险
 3. 系统级风险
+
+其中 `WATCHING`、`COOLDOWN`、`HALTED`、`OK`、`DEGRADED` 等状态词的统一含义见 [术语表](glossary.md)。
 
 ## 4. 账户级风险控制
 
@@ -193,6 +197,9 @@ LMR-Hunter 的风控目标不是消灭亏损，而是限制错误事件的破坏
 
 这些内容分别放在：
 
+- [文档地图](index.md)
+- [项目状态](status.md)
+- [术语表](glossary.md)
 - [策略文档](strategy.md)
 - [架构文档](architecture.md)
 - [开发计划](development-plan.md)

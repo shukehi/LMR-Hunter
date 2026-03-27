@@ -142,8 +142,8 @@ class EpisodeBuilder:
     将逐笔强平事件聚合为 episode（一次连续冲击 = 一条研究样本）。
 
     终止条件（满足任一即关闭当前 episode）：
-      1. 两笔事件间隔 > gap_ms（默认 30 秒）
-      2. episode 总持续时间 > max_duration_ms（默认 300 秒）
+      1. 两笔事件间隔 >= gap_ms（默认 30 秒，含边界）
+      2. episode 总持续时间 >= max_duration_ms（默认 300 秒，含边界）
 
     过滤条件：
       - 总名义价值 < noise_threshold_usdt → 视为噪声，不生成样本（discarded）

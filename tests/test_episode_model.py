@@ -232,3 +232,68 @@ def test_stats_tracking():
     assert builder.stats["emitted"]   == 1
     assert builder.stats["discarded"] == 1
     assert builder.stats["active"]    == 0
+
+
+# ── 7. 精确边界：>= 语义回归测试 ──────────────────────────────────────────────
+# 文档与实现均使用 >= （含边界），下面 4 条测试锁定全部边界组合。
+
+def test_gap_exactly_equal_closes_episode():
+    """gap 恰好等于 gap_ms（== 30000ms）时应触发关闭（>= 语义）。"""
+    builder = EpisodeBuilder(gap_ms=30_000, noise_threshold_usdt=50_000)
+    _feed(builder, offset=0)
+    _feed(builder, offset=5_000)
+    # 第三笔与第二笔间隔恰好 30000ms == gap_ms → 应关闭第一波
+    closed = _feed(builder, offset=35_000)
+    assert closed is not None, "gap == gap_ms 时应触发关闭"
+    assert closed.liq_count == 2
+    # 第三笔已开启新 episode
+    remaining = builder.flush()
+    assert remaining is not None
+    assert remaining.liq_count == 1
+
+
+def test_gap_one_ms_under_does_not_close():
+    """gap 比 gap_ms 少 1ms（29999ms < 30000ms）时不应触发关闭。"""
+    builder = EpisodeBuilder(gap_ms=30_000, noise_threshold_usdt=50_000)
+    _feed(builder, offset=0)
+    _feed(builder, offset=5_000)
+    # 间隔 29999ms < 30000ms → 不关闭，应返回 None
+    still_open = _feed(builder, offset=34_999)
+    assert still_open is None, "gap < gap_ms 时不应关闭"
+    ep = builder.flush()
+    assert ep is not None
+    assert ep.liq_count == 3
+
+
+def test_duration_exactly_equal_closes_episode():
+    """duration 恰好等于 max_duration_ms 时应触发关闭（已有覆盖，此为独立回归）。"""
+    builder = EpisodeBuilder(
+        gap_ms=30_000, noise_threshold_usdt=50_000, max_duration_ms=50_000
+    )
+    _feed(builder, offset=0)
+    _feed(builder, offset=10_000)
+    _feed(builder, offset=20_000)
+    # t=50s: duration = 50000ms == max_duration_ms → 关闭
+    closed = _feed(builder, offset=50_000)
+    assert closed is not None, "duration == max_duration_ms 时应触发关闭"
+    assert closed.liq_count == 3
+    assert closed.duration_ms == 20_000   # 末笔是 t=20s
+
+
+def test_duration_one_ms_under_does_not_close():
+    """duration 比 max_duration_ms 少 1ms 时不应触发关闭。
+
+    使用 25s 间隔（< gap_ms=30s），确保 gap 条件不先触发：
+    t=0 → t=25s (gap=25s < 30s) → t=49999ms (gap=24999ms < 30s, duration=49999 < 50000) → 不关闭。
+    """
+    builder = EpisodeBuilder(
+        gap_ms=30_000, noise_threshold_usdt=50_000, max_duration_ms=50_000
+    )
+    _feed(builder, offset=0)
+    _feed(builder, offset=25_000)
+    # gap=24999ms < 30000ms，duration=49999ms < 50000ms → 两个条件均不满足
+    still_open = _feed(builder, offset=49_999)
+    assert still_open is None, "duration < max_duration_ms 且 gap < gap_ms 时不应关闭"
+    ep = builder.flush()
+    assert ep is not None
+    assert ep.liq_count == 3

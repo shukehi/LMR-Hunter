@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import statistics
 from datetime import datetime, timezone
@@ -34,6 +35,115 @@ SYMBOL       = "BTCUSDT"
 # 回弹判定：价格回到 VWAP 上方视为回弹成功
 RECOVERY_WINDOWS_MS = [60_000, 120_000, 300_000]   # 1min, 2min, 5min
 RECOVERY_LABEL      = {60_000: "1min", 120_000: "2min", 300_000: "5min"}
+
+
+# ── Run Validity（阶段 D）────────────────────────────────────────────────────────
+
+async def load_run_validity(db: aiosqlite.Connection, since_ts: int) -> dict:
+    """
+    检查指定时间范围内的数据可信性。
+
+    数据源：
+    - service_heartbeats.status     — "DEGRADED" 表示该 run 已发生样本损坏
+    - service_heartbeats.notes      — JSON 字段，含累计完整性计数器
+      （overflow_dropped / isolated / lost；进程生命周期内单调递增）
+    - risk_events                   — 严重度 CRITICAL / ERROR 的风控事件
+
+    判定规则（与 runtime-optimization-plan.md 阶段 D 保持一致）：
+      TRUSTED      — 无任何样本损坏，心跳状态全部 OK
+      CONTAMINATED — 出现以下任一：
+                       overflow_dropped > 0
+                       isolated > 0
+                       lost > 0
+                       任何心跳 status = DEGRADED
+      UNKNOWN      — 时间范围内无心跳记录，无法判断
+
+    返回字段：
+      status                  : "TRUSTED" | "CONTAMINATED" | "UNKNOWN"
+      overflow_dropped        : 窗口内各心跳 notes 中 overflow_dropped 的最大值
+      isolated                : 同上，isolated
+      lost                    : 同上，lost
+      degraded_heartbeat_count: status=DEGRADED 的心跳数量
+      first_degraded_ts       : 最早一条 DEGRADED 心跳的时间戳（ms），None 表示无
+      critical_risk_events    : CRITICAL/ERROR 风控事件列表
+      heartbeat_count         : 窗口内心跳总数
+    """
+    # 1. 读取窗口内所有心跳
+    rows = await (await db.execute(
+        """
+        SELECT ts, status, notes FROM service_heartbeats
+        WHERE ts >= ?
+        ORDER BY ts ASC
+        """,
+        (since_ts,),
+    )).fetchall()
+
+    heartbeat_count      = len(rows)
+    max_overflow_dropped = 0
+    max_isolated         = 0
+    max_lost             = 0
+    degraded_ts_list: list[int] = []
+
+    for ts, status, notes_str in rows:
+        if status == "DEGRADED":
+            degraded_ts_list.append(ts)
+        if notes_str:
+            try:
+                notes = json.loads(notes_str)
+                max_overflow_dropped = max(max_overflow_dropped,
+                                           notes.get("overflow_dropped", 0))
+                max_isolated         = max(max_isolated,
+                                           notes.get("isolated", 0))
+                max_lost             = max(max_lost,
+                                           notes.get("lost", 0))
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+    # 2. 读取 CRITICAL / ERROR 风控事件
+    risk_rows = await (await db.execute(
+        """
+        SELECT ts, component, event_type, severity, message
+        FROM risk_events
+        WHERE ts >= ? AND severity IN ('CRITICAL', 'ERROR')
+        ORDER BY ts ASC
+        """,
+        (since_ts,),
+    )).fetchall()
+
+    critical_risk_events = [
+        {
+            "ts":         r[0],
+            "component":  r[1],
+            "event_type": r[2],
+            "severity":   r[3],
+            "message":    r[4],
+        }
+        for r in risk_rows
+    ]
+
+    # 3. 判定可信性
+    if heartbeat_count == 0:
+        validity_status = "UNKNOWN"
+    elif (
+        max_overflow_dropped > 0
+        or max_isolated > 0
+        or max_lost > 0
+        or len(degraded_ts_list) > 0
+    ):
+        validity_status = "CONTAMINATED"
+    else:
+        validity_status = "TRUSTED"
+
+    return {
+        "status":                  validity_status,
+        "overflow_dropped":        max_overflow_dropped,
+        "isolated":                max_isolated,
+        "lost":                    max_lost,
+        "degraded_heartbeat_count": len(degraded_ts_list),
+        "first_degraded_ts":       degraded_ts_list[0] if degraded_ts_list else None,
+        "critical_risk_events":    critical_risk_events,
+        "heartbeat_count":         heartbeat_count,
+    }
 
 
 # ── 数据读取 ───────────────────────────────────────────────────────────────────
@@ -157,6 +267,74 @@ def bucket_analysis(
 
 
 # ── 报告生成 ──────────────────────────────────────────────────────────────────
+
+def _fmt_ts(ts_ms: int | None) -> str:
+    """将毫秒时间戳格式化为 UTC 字符串，None 时返回 'N/A'。"""
+    if ts_ms is None:
+        return "N/A"
+    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
+
+
+def build_validity_section(validity: dict) -> str:
+    """
+    生成数据可信性摘要，置于报告最顶部。
+
+    TRUSTED      — 绿灯，结论可用于研究参考
+    CONTAMINATED — 红灯，结论不得用于参数决策
+    UNKNOWN      — 黄灯，无心跳记录，无法判断
+    """
+    lines = []
+    status = validity["status"]
+
+    if status == "TRUSTED":
+        badge = "✓ TRUSTED（可信）"
+        guidance = "数据完整，当前报告结论可用于研究参考。"
+    elif status == "CONTAMINATED":
+        badge = "✗ CONTAMINATED（污染）"
+        guidance = (
+            "当前报告包含受污染数据，结论不得用于策略参数决策。\n"
+            "  污染数据只能用于系统链路观察，不能作为净期望判断依据。"
+        )
+    else:
+        badge = "? UNKNOWN（未知）"
+        guidance = "时间范围内无心跳记录，无法判断数据可信性，请谨慎使用结论。"
+
+    lines.append("=" * 60)
+    lines.append(f"  数据可信性  {badge}")
+    lines.append("=" * 60)
+    lines.append(f"  {guidance}")
+
+    # 完整性计数器明细
+    lines.append("")
+    lines.append(f"  心跳记录数         : {validity['heartbeat_count']}")
+    lines.append(f"  overflow_dropped   : {validity['overflow_dropped']}"
+                 + ("  ← 队列溢出，最旧样本已丢失" if validity["overflow_dropped"] > 0 else ""))
+    lines.append(f"  isolated           : {validity['isolated']}"
+                 + ("  ← DB 写入失败，已写隔离文件" if validity["isolated"] > 0 else ""))
+    lines.append(f"  lost               : {validity['lost']}"
+                 + ("  ← 永久丢失（隔离文件也失败）" if validity["lost"] > 0 else ""))
+    lines.append(f"  DEGRADED 心跳数    : {validity['degraded_heartbeat_count']}")
+
+    if validity["first_degraded_ts"] is not None:
+        lines.append(f"  首次 DEGRADED 时间 : {_fmt_ts(validity['first_degraded_ts'])}")
+        lines.append(f"  ⚠ 该时间点之前的数据可能仍可信，之后的数据应视为污染")
+
+    # CRITICAL 风控事件摘要（最多展示前 5 条）
+    risk_events = validity["critical_risk_events"]
+    if risk_events:
+        lines.append("")
+        lines.append(f"  CRITICAL/ERROR 风控事件（共 {len(risk_events)} 条，展示最早 5 条）：")
+        for ev in risk_events[:5]:
+            lines.append(
+                f"    [{_fmt_ts(ev['ts'])}] {ev['severity']} | "
+                f"{ev['event_type']} | {(ev['message'] or '')[:60]}"
+            )
+
+    lines.append("")
+    return "\n".join(lines)
+
 
 def fmt_rate(rate: float | None) -> str:
     if rate is None:
@@ -292,9 +470,10 @@ async def main(days: int | None) -> None:
 
     db = await aiosqlite.connect(db_path)
     try:
-        signals = await load_signals(db, since_ts)
-        results = await analyze_recovery(db, signals)
-        report  = build_report(results, days)
+        validity = await load_run_validity(db, since_ts)
+        signals  = await load_signals(db, since_ts)
+        results  = await analyze_recovery(db, signals)
+        report   = build_validity_section(validity) + build_report(results, days)
     finally:
         await db.close()
 

@@ -35,6 +35,7 @@
 | [reviews/index.md](reviews/index.md) | 审查记录入口 | 否 |
 | [reviews/optimization-plan.md](reviews/optimization-plan.md) | 第一轮结构性优化审查记录 | 否 |
 | [reviews/runtime-optimization-plan.md](reviews/runtime-optimization-plan.md) | 运行态复盘后的第二轮审查记录 | 否 |
+| [market-sessions.md](market-sessions.md) | 全球主要市场开盘时间与各盘口对策略的影响 | 是 |
 
 ## 4. 维护规则
 

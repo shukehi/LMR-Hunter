@@ -152,3 +152,30 @@ def test_rebound_depth_bps_calculation():
     oc = compute_outcome("EP_1", BASE_TS, entry, vwap, trades)
     expected = (vwap - entry) / entry * 10_000
     assert oc.rebound_depth_bps == pytest.approx(expected, abs=0.1)  # round(, 1)
+
+
+# ── price_at_episode_end ───────────────────────────────────────────────────────
+
+def test_price_at_episode_end_is_first_trade():
+    """price_at_episode_end = 第一笔成交价（episode 结束后最早可下单的市场价格）。"""
+    trades = _trades([
+        (1_000,   84_500.0),   # 最早一笔 → price_at_episode_end
+        (30_000,  84_800.0),
+        (120_000, 85_200.0),
+    ])
+    oc = compute_outcome("EP_1", BASE_TS, 85_000.0, 86_000.0, trades)
+    assert oc.price_at_episode_end == pytest.approx(84_500.0)
+
+
+def test_price_at_episode_end_none_when_no_trades():
+    """15 分钟内无成交 → price_at_episode_end 为 None。"""
+    oc = compute_outcome("EP_1", BASE_TS, 85_000.0, 86_000.0, [])
+    assert oc.price_at_episode_end is None
+
+
+def test_price_at_episode_end_independent_of_entry_price():
+    """price_at_episode_end 与 entry_price 无关，entry=None 时仍可计算。"""
+    trades = _trades([(500, 83_000.0)])
+    oc = compute_outcome("EP_1", BASE_TS, None, 86_000.0, trades)
+    assert oc.price_at_episode_end == pytest.approx(83_000.0)
+    assert oc.mae_bps is None   # entry=None 时 MAE 不可计算

@@ -3,6 +3,7 @@ Episode outcome 计算引擎（纯计算，无 I/O）。
 
 定义：
   - entry_price          = min_mid_price（episode 期间最低盘口中价，理论做多入场价）
+  - price_at_episode_end = episode 结束后第一笔真实成交价（最早可下单时刻的市场价格）
   - MAE（最大不利偏移）   = 入场后 0-5 分钟最低价 vs entry（负值 = 亏损深度）
   - MFE（最大有利偏移）   = 入场后 0-5 分钟最高价 vs entry（正值 = 潜在盈利空间）
   - rebound_to_vwap_ms   = 价格首次回到 pre_event_vwap 的延迟（衡量修复速度）
@@ -36,7 +37,8 @@ class EpisodeOutcome:
       - 验证反弹目标距离：rebound_depth_bps（VWAP 相对入场价的距离）
     """
     episode_id:          str
-    entry_price:         float | None   # 理论入场价 = min_mid_price
+    entry_price:         float | None   # 理论入场价 = min_mid_price（episode 期间最低价）
+    price_at_episode_end: float | None  # episode 结束后首笔成交价（可下单的最早真实价格）
     price_at_1m:         float | None   # episode 结束后 1 分钟的价格
     price_at_5m:         float | None   # episode 结束后 5 分钟的价格
     price_at_15m:        float | None   # episode 结束后 15 分钟的价格
@@ -69,6 +71,9 @@ def compute_outcome(
         trades:         [(trade_ts, price), ...] — end_event_ts 之后 15 分钟的成交，升序
     """
     n = len(trades)
+
+    # episode 结束后首笔成交价（最早可下单时刻的市场价格）
+    price_at_episode_end: float | None = trades[0][1] if trades else None
 
     # 按时间窗口边界分桶（trade_ts 相对于 end_event_ts 的偏移）
     t1_cutoff  = end_event_ts + _WINDOW_1M_MS
@@ -113,9 +118,10 @@ def compute_outcome(
         rebound_depth = round((pre_event_vwap - entry_price) / entry_price * 10_000, 1)
 
     return EpisodeOutcome(
-        episode_id          = episode_id,
-        entry_price         = entry_price,
-        price_at_1m         = price_at_1m,
+        episode_id           = episode_id,
+        entry_price          = entry_price,
+        price_at_episode_end = price_at_episode_end,
+        price_at_1m          = price_at_1m,
         price_at_5m         = price_at_5m,
         price_at_15m        = price_at_15m,
         min_price_0_5m      = min_5m,

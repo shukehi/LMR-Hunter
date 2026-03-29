@@ -159,7 +159,8 @@ CREATE INDEX IF NOT EXISTS idx_episodes_symbol ON liquidation_episodes(symbol);
 CREATE TABLE IF NOT EXISTS episode_outcomes (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     episode_id           TEXT    NOT NULL UNIQUE REFERENCES liquidation_episodes(episode_id),
-    entry_price          REAL,            -- 理论入场价 = episode.min_mid_price
+    entry_price          REAL,            -- 理论入场价 = episode.min_mid_price（episode 期间最低价）
+    price_at_episode_end REAL,            -- episode 结束后首笔成交价（可下单的最早真实价格）
     price_at_1m          REAL,            -- episode 结束后 1 分钟的价格快照
     price_at_5m          REAL,            -- episode 结束后 5 分钟的价格快照
     price_at_15m         REAL,            -- episode 结束后 15 分钟的价格快照

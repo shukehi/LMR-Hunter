@@ -86,16 +86,17 @@ class EpisodeRow:
     end_event_ts:        int
     liq_count:           int            # episode 内强平笔数
     liq_notional_total:  float
-    min_mid_price:       Optional[float]
-    pre_event_vwap:      Optional[float]
-    max_deviation_bps:   Optional[float]
-    mae_bps:             Optional[float]
-    mfe_bps:             Optional[float]
-    rebound_to_vwap_ms:  Optional[int]
-    rebound_depth_bps:   Optional[float]
-    price_at_5m:         Optional[float]
-    entry_price:         Optional[float]   # = outcome.entry_price（= min_mid_price）
-    trade_count_0_15m:   int = 0           # outcome 窗口 15 分钟内的成交笔数
+    min_mid_price:         Optional[float]
+    pre_event_vwap:        Optional[float]
+    max_deviation_bps:     Optional[float]
+    mae_bps:               Optional[float]
+    mfe_bps:               Optional[float]
+    rebound_to_vwap_ms:    Optional[int]
+    rebound_depth_bps:     Optional[float]
+    price_at_5m:           Optional[float]
+    entry_price:           Optional[float]   # = outcome.entry_price（= min_mid_price）
+    price_at_episode_end:  Optional[float]   # episode 结束后首笔成交价（可下单最早真实价格）
+    trade_count_0_15m:     int = 0           # outcome 窗口 15 分钟内的成交笔数
     session:             str = field(default="")
 
     def __post_init__(self) -> None:
@@ -257,6 +258,7 @@ async def load_episodes(
             o.rebound_depth_bps,
             o.price_at_5m,
             o.entry_price,
+            o.price_at_episode_end,
             o.trade_count_0_15m
         FROM liquidation_episodes  e
         JOIN episode_outcomes       o ON o.episode_id = e.episode_id
@@ -281,10 +283,11 @@ async def load_episodes(
             mae_bps            = r[8],
             mfe_bps            = r[9],
             rebound_to_vwap_ms = r[10],
-            rebound_depth_bps  = r[11],
-            price_at_5m        = r[12],
-            entry_price        = r[13],
-            trade_count_0_15m  = r[14],
+            rebound_depth_bps    = r[11],
+            price_at_5m          = r[12],
+            entry_price          = r[13],
+            price_at_episode_end = r[14],
+            trade_count_0_15m    = r[15],
         )
         for r in rows
     ]

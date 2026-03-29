@@ -530,22 +530,23 @@ class DatabaseWriter:
             await self._conn.execute(
                 """
                 INSERT OR IGNORE INTO episode_outcomes
-                    (episode_id, entry_price,
+                    (episode_id, entry_price, price_at_episode_end,
                      price_at_1m, price_at_5m, price_at_15m,
                      min_price_0_5m, max_price_0_5m,
                      min_price_0_15m, max_price_0_15m,
                      mae_bps, mfe_bps,
                      rebound_to_vwap_ms, rebound_depth_bps,
                      trade_count_0_15m, computed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    outcome.episode_id,    outcome.entry_price,
-                    outcome.price_at_1m,   outcome.price_at_5m,  outcome.price_at_15m,
-                    outcome.min_price_0_5m, outcome.max_price_0_5m,
-                    outcome.min_price_0_15m, outcome.max_price_0_15m,
-                    outcome.mae_bps,       outcome.mfe_bps,
-                    outcome.rebound_to_vwap_ms, outcome.rebound_depth_bps,
+                    outcome.episode_id,          outcome.entry_price,
+                    outcome.price_at_episode_end,
+                    outcome.price_at_1m,          outcome.price_at_5m,  outcome.price_at_15m,
+                    outcome.min_price_0_5m,       outcome.max_price_0_5m,
+                    outcome.min_price_0_15m,      outcome.max_price_0_15m,
+                    outcome.mae_bps,              outcome.mfe_bps,
+                    outcome.rebound_to_vwap_ms,   outcome.rebound_depth_bps,
                     outcome.trade_count_0_15m,
                     int(time.time() * 1000),
                 ),

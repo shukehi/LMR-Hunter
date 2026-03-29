@@ -84,6 +84,7 @@ class EpisodeRow:
     episode_id:          str
     start_event_ts:      int
     end_event_ts:        int
+    liq_count:           int            # episode 内强平笔数
     liq_notional_total:  float
     min_mid_price:       Optional[float]
     pre_event_vwap:      Optional[float]
@@ -94,6 +95,7 @@ class EpisodeRow:
     rebound_depth_bps:   Optional[float]
     price_at_5m:         Optional[float]
     entry_price:         Optional[float]   # = outcome.entry_price（= min_mid_price）
+    trade_count_0_15m:   int = 0           # outcome 窗口 15 分钟内的成交笔数
     session:             str = field(default="")
 
     def __post_init__(self) -> None:
@@ -115,6 +117,118 @@ class TradeResult:
         return self.pnl_bps is not None and self.pnl_bps > 0
 
 
+# ── 合格性过滤 ────────────────────────────────────────────────────────────────
+
+# 合格性阈值（与 docs/reviews/shadow-mode-admission.md 第 2 节保持一致）
+QUAL_MIN_NOTIONAL_USD   = 100_000.0   # 最低强平名义价值
+QUAL_MAX_DEVIATION_BPS  = -10.0       # 最深偏离（max_deviation_bps 为负值，需 <= -10）
+QUAL_MIN_LIQ_COUNT      = 3           # 最少强平笔数
+QUAL_MIN_TRADE_COUNT    = 30          # outcome 窗口最少成交笔数
+QUAL_MIN_REBOUND_DEPTH  = 10.0        # 最小反弹目标距离（bps）
+QUAL_MIN_GAP_MS         = 900_000     # 与上一条合格 episode 的最小间隔（15 分钟）
+
+
+@dataclass
+class QualReject:
+    """被过滤掉的 episode 及拒绝原因。"""
+    episode_id: str
+    session:    str
+    reasons:    list[str]
+
+
+def qualify_episode(ep: EpisodeRow) -> list[str]:
+    """
+    检查单条 episode 的静态合格性（不含独立性检查，独立性需要序列上下文）。
+
+    返回拒绝原因列表；空列表 = 静态条件全部通过。
+
+    检查维度（对应 shadow-mode-admission.md 第 2.1-2.3 节）：
+        2.1 数据完整性
+        2.2 信号真实性
+        2.3 因果结构有效性
+    """
+    reasons: list[str] = []
+
+    # ── 2.1 数据完整性 ─────────────────────────────────────────────────────────
+    if ep.mae_bps is None:
+        reasons.append("mae_bps IS NULL")
+    if ep.mfe_bps is None:
+        reasons.append("mfe_bps IS NULL")
+    if ep.price_at_5m is None:
+        reasons.append("price_at_5m IS NULL")
+    if ep.entry_price is None:
+        reasons.append("entry_price IS NULL")
+    if ep.pre_event_vwap is None:
+        reasons.append("pre_event_vwap IS NULL")
+    if ep.trade_count_0_15m < QUAL_MIN_TRADE_COUNT:
+        reasons.append(
+            f"trade_count_0_15m={ep.trade_count_0_15m} < {QUAL_MIN_TRADE_COUNT}"
+        )
+
+    # ── 2.2 信号真实性 ─────────────────────────────────────────────────────────
+    if ep.liq_notional_total < QUAL_MIN_NOTIONAL_USD:
+        reasons.append(
+            f"liq_notional_total={ep.liq_notional_total:.0f} < {QUAL_MIN_NOTIONAL_USD:.0f}"
+        )
+    if ep.max_deviation_bps is None or ep.max_deviation_bps > QUAL_MAX_DEVIATION_BPS:
+        reasons.append(
+            f"max_deviation_bps={ep.max_deviation_bps} > {QUAL_MAX_DEVIATION_BPS}"
+        )
+    if ep.liq_count < QUAL_MIN_LIQ_COUNT:
+        reasons.append(f"liq_count={ep.liq_count} < {QUAL_MIN_LIQ_COUNT}")
+
+    # ── 2.3 因果结构有效性 ─────────────────────────────────────────────────────
+    if ep.rebound_depth_bps is None or ep.rebound_depth_bps < QUAL_MIN_REBOUND_DEPTH:
+        reasons.append(
+            f"rebound_depth_bps={ep.rebound_depth_bps} < {QUAL_MIN_REBOUND_DEPTH}"
+        )
+
+    return reasons
+
+
+def filter_qualified(
+    episodes: list[EpisodeRow],
+) -> tuple[list[EpisodeRow], list[QualReject]]:
+    """
+    对按 start_event_ts 升序排列的 episode 列表进行全量合格性过滤。
+
+    依次执行：
+      1. 静态合格性（qualify_episode）
+      2. 统计独立性（与上一条合格 episode 的间隔 >= QUAL_MIN_GAP_MS）
+
+    返回：
+        qualified — 通过所有检查的 episode 列表（保持升序）
+        rejected  — 被过滤掉的记录及拒绝原因列表
+    """
+    qualified: list[EpisodeRow]  = []
+    rejected:  list[QualReject]  = []
+    last_end_ts: int = 0   # 上一条合格 episode 的 end_event_ts
+
+    for ep in episodes:
+        reasons = qualify_episode(ep)
+
+        # 2.4 统计独立性（仅在静态条件全部通过时检查，避免噪声 episode 占用间隔槽）
+        if not reasons and last_end_ts > 0:
+            gap_ms = ep.start_event_ts - last_end_ts
+            if gap_ms < QUAL_MIN_GAP_MS:
+                reasons.append(
+                    f"independence: gap={gap_ms / 1000:.0f}s "
+                    f"< {QUAL_MIN_GAP_MS // 1000}s from prev qualified"
+                )
+
+        if reasons:
+            rejected.append(QualReject(
+                episode_id = ep.episode_id,
+                session    = ep.session,
+                reasons    = reasons,
+            ))
+        else:
+            qualified.append(ep)
+            last_end_ts = ep.end_event_ts
+
+    return qualified, rejected
+
+
 # ── 数据加载 ─────────────────────────────────────────────────────────────────
 
 async def load_episodes(
@@ -132,6 +246,7 @@ async def load_episodes(
             e.episode_id,
             e.start_event_ts,
             e.end_event_ts,
+            e.liq_count,
             e.liq_notional_total,
             e.min_mid_price,
             e.pre_event_vwap,
@@ -141,7 +256,8 @@ async def load_episodes(
             o.rebound_to_vwap_ms,
             o.rebound_depth_bps,
             o.price_at_5m,
-            o.entry_price
+            o.entry_price,
+            o.trade_count_0_15m
         FROM liquidation_episodes  e
         JOIN episode_outcomes       o ON o.episode_id = e.episode_id
         WHERE e.symbol = 'BTCUSDT'
@@ -157,16 +273,18 @@ async def load_episodes(
             episode_id         = r[0],
             start_event_ts     = r[1],
             end_event_ts       = r[2],
-            liq_notional_total = r[3],
-            min_mid_price      = r[4],
-            pre_event_vwap     = r[5],
-            max_deviation_bps  = r[6],
-            mae_bps            = r[7],
-            mfe_bps            = r[8],
-            rebound_to_vwap_ms = r[9],
-            rebound_depth_bps  = r[10],
-            price_at_5m        = r[11],
-            entry_price        = r[12],
+            liq_count          = r[3],
+            liq_notional_total = r[4],
+            min_mid_price      = r[5],
+            pre_event_vwap     = r[6],
+            max_deviation_bps  = r[7],
+            mae_bps            = r[8],
+            mfe_bps            = r[9],
+            rebound_to_vwap_ms = r[10],
+            rebound_depth_bps  = r[11],
+            price_at_5m        = r[12],
+            entry_price        = r[13],
+            trade_count_0_15m  = r[14],
         )
         for r in rows
     ]
@@ -444,18 +562,82 @@ def build_sensitivity_table(
     return "\n".join(lines)
 
 
+def build_qualification_section(
+    all_episodes: list[EpisodeRow],
+    qualified:    list[EpisodeRow],
+    rejected:     list[QualReject],
+) -> str:
+    """
+    生成样本合格性过滤摘要，显示：
+    - 原始 / 合格 / 被过滤 的数量
+    - 主要拒绝原因统计
+    - 距离准入门槛的差距
+    """
+    n_all  = len(all_episodes)
+    n_qual = len(qualified)
+    n_rej  = len(rejected)
+
+    # 统计拒绝原因频次（取每条记录的第一个原因作为主因）
+    reason_counts: dict[str, int] = {}
+    for r in rejected:
+        # 归一化：截断具体数值，只保留原因类型
+        raw = r.reasons[0] if r.reasons else "unknown"
+        # 提取原因键（去掉 = 后面的具体数值）
+        key = raw.split("=")[0].split(":")[0].strip()
+        reason_counts[key] = reason_counts.get(key, 0) + 1
+
+    # 合格样本的盘口分布
+    qual_session: dict[str, int] = {}
+    for ep in qualified:
+        qual_session[ep.session] = qual_session.get(ep.session, 0) + 1
+
+    # 准入门槛对比（shadow-mode-admission.md 第 3 节）
+    THRESHOLDS = {"美盘": 25, "欧盘": 15, "亚盘": 10}
+    gap_lines = []
+    for session, need in THRESHOLDS.items():
+        have = qual_session.get(session, 0)
+        symbol = "✓" if have >= need else "✗"
+        gap_lines.append(
+            f"    {symbol} {session}: {have}/{need}"
+            + (f"  还差 {need - have} 条" if have < need else "  已达标")
+        )
+    total_need = 60
+    total_have = n_qual
+    gap_lines.append(
+        f"    {'✓' if total_have >= total_need else '✗'} 总计: "
+        f"{total_have}/{total_need}"
+        + (f"  还差 {total_need - total_have} 条" if total_have < total_need else "  已达标")
+    )
+
+    lines = [
+        f"  原始 episode : {n_all}  合格 : {n_qual}  过滤掉 : {n_rej}",
+        f"  合格样本盘口 : " + "  ".join(
+            f"{s}:{qual_session.get(s, 0)}" for s in SESSION_LABELS
+        ),
+    ]
+    if reason_counts:
+        lines.append("  主要过滤原因：")
+        for reason, cnt in sorted(reason_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"    {cnt:>3}条  {reason}")
+    lines.append("  Shadow Mode 准入门槛进度（shadow-mode-admission.md 第 3 节）：")
+    lines.extend(gap_lines)
+
+    return "\n".join(lines)
+
+
 async def build_report(db: aiosqlite.Connection, since_ts: int = 0) -> str:
-    """生成完整可交易口径研究报告。"""
+    """生成完整可交易口径研究报告（基于合格样本）。"""
     now_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     # ── 数据可信性 ────────────────────────────────────────────────────────────
     validity = await load_run_validity(db, since_ts=since_ts)
     validity_section = build_validity_section(validity)
 
-    # ── 加载 episode 数据 ──────────────────────────────────────────────────────
-    episodes = await load_episodes(db, since_ts=since_ts)
+    # ── 加载并过滤 episode 数据 ───────────────────────────────────────────────
+    all_episodes = await load_episodes(db, since_ts=since_ts)
+    episodes, rejected = filter_qualified(all_episodes)
 
-    if not episodes:
+    if not all_episodes:
         return (
             f"LMR-Hunter 可交易口径研究报告 — {now_str}\n"
             + "=" * 60 + "\n"
@@ -463,20 +645,20 @@ async def build_report(db: aiosqlite.Connection, since_ts: int = 0) -> str:
             + "⚠️  暂无有效 episode 数据（需同时有 liquidation_episodes + episode_outcomes 记录）。\n"
         )
 
-    # ── 数据概况 ──────────────────────────────────────────────────────────────
-    ts_start = _fmt_ts(episodes[0].start_event_ts)
-    ts_end   = _fmt_ts(episodes[-1].start_event_ts)
+    # ── 数据概况（基于原始 + 合格口径） ──────────────────────────────────────
+    ts_start = _fmt_ts(all_episodes[0].start_event_ts)
+    ts_end   = _fmt_ts(all_episodes[-1].start_event_ts)
     session_counts: dict[str, int] = {}
-    for ep in episodes:
+    for ep in all_episodes:
         session_counts[ep.session] = session_counts.get(ep.session, 0) + 1
 
-    notionals = [ep.liq_notional_total for ep in episodes]
-    deviations = [ep.max_deviation_bps for ep in episodes if ep.max_deviation_bps is not None]
+    notionals  = [ep.liq_notional_total for ep in all_episodes]
+    deviations = [ep.max_deviation_bps  for ep in all_episodes if ep.max_deviation_bps is not None]
 
     summary_lines = [
         f"  样本时段 : {ts_start}  →  {ts_end}",
-        f"  总 episode 数 : {len(episodes)}",
-        f"  盘口分布 : " + "  ".join(
+        f"  原始 episode 数 : {len(all_episodes)}  合格 : {len(episodes)}",
+        f"  原始盘口分布 : " + "  ".join(
             f"{s}:{session_counts.get(s, 0)}" for s in SESSION_LABELS
         ),
         f"  强平名义价值 : "
@@ -489,6 +671,25 @@ async def build_report(db: aiosqlite.Connection, since_ts: int = 0) -> str:
             f"中位数 {statistics.median(deviations):.1f}  "
             f"最小（最深）{min(deviations):.1f}"
         )
+
+    # 后续统计分析使用合格样本；如合格样本为空则跳过统计部分
+    if not episodes:
+        sep = "=" * 68
+        return "\n".join([
+            "LMR-Hunter 可交易口径研究报告",
+            f"生成时间：{now_str}",
+            sep,
+            validity_section,
+            sep,
+            "【一】数据概况",
+            "\n".join(summary_lines),
+            sep,
+            "【样本合格性】",
+            build_qualification_section(all_episodes, episodes, rejected),
+            sep,
+            "⚠️  合格样本数为 0，跳过统计分析。请等待更多数据积累。",
+            sep,
+        ]) + "\n"
 
     # ── 默认参数全局模拟 ───────────────────────────────────────────────────────
     default_params = SimParams(
@@ -578,7 +779,12 @@ async def build_report(db: aiosqlite.Connection, since_ts: int = 0) -> str:
         "\n".join(summary_lines),
         "",
         sep,
-        "【二】全局可交易模拟（默认参数）",
+        "【二】样本合格性过滤",
+        sub,
+        build_qualification_section(all_episodes, episodes, rejected),
+        "",
+        sep,
+        "【三】全局可交易模拟（仅合格样本 · 默认参数）",
         f"  entry_offset={default_params.entry_offset_bps:.0f}bps  "
         f"hard_stop={default_params.hard_stop_bps:.0f}bps  "
         f"time_stop={default_params.time_stop_sec}s  "
@@ -588,16 +794,16 @@ async def build_report(db: aiosqlite.Connection, since_ts: int = 0) -> str:
         build_stats_block(global_stats),
         "",
         sep,
-        "【三】按盘口分组统计（默认参数）",
+        "【四】按盘口分组统计（仅合格样本 · 默认参数）",
         sub,
         "\n".join(session_blocks),
         "",
         sep,
-        "【四】参数敏感性分析",
+        "【五】参数敏感性分析（仅合格样本）",
         sub,
         sensitivity,
         sep,
-        "【五】回弹质量分布（辅助观测，不作为参数建议主依据）",
+        "【六】回弹质量分布（辅助观测，不作为参数建议主依据）",
         sub,
         "\n".join(rebound_lines),
         "  按盘口：",

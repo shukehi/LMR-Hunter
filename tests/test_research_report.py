@@ -20,6 +20,16 @@
   16. build_report    — 无数据时返回合理报告（不崩溃）
   17. build_report    — 有数据时报告包含核心关键词
   18. classify_session — 边界值：07:00、13:30、21:00 精确分段
+  19. qualify_episode — 合格样本通过所有检查
+  20. qualify_episode — mae_bps IS NULL 被拒绝
+  21. qualify_episode — trade_count_0_15m 不足被拒绝
+  22. qualify_episode — liq_notional_total 不足被拒绝
+  23. qualify_episode — max_deviation_bps 偏浅被拒绝
+  24. qualify_episode — liq_count 不足被拒绝
+  25. qualify_episode — rebound_depth_bps 不足被拒绝
+  26. filter_qualified — 独立性检查剔除间隔不足的 episode
+  27. filter_qualified — 多条合格 episode 顺序输出正确
+  28. filter_qualified — 不合格 episode 不影响独立性计时器
 """
 from __future__ import annotations
 
@@ -34,13 +44,16 @@ import pytest_asyncio
 
 from src.analysis.research_report import (
     EpisodeRow,
+    QualReject,
     SimParams,
     Stats,
     TradeResult,
     aggregate_stats,
     build_report,
     classify_session,
+    filter_qualified,
     load_episodes,
+    qualify_episode,
     simulate_trade,
 )
 
@@ -58,6 +71,7 @@ def make_episode(
     episode_id:          str  = "BTCUSDT_1000000",
     start_event_ts:      int  = BASE_TS_US,
     end_event_ts:        int  = BASE_TS_US + 30_000,
+    liq_count:           int  = 5,
     liq_notional_total:  float = 500_000.0,
     min_mid_price:       Optional[float] = 80_000.0,
     pre_event_vwap:      Optional[float] = 82_000.0,
@@ -68,11 +82,13 @@ def make_episode(
     rebound_depth_bps:   Optional[float] = 250.0,
     price_at_5m:         Optional[float] = 81_500.0,
     entry_price:         Optional[float] = 80_000.0,
+    trade_count_0_15m:   int  = 100,
 ) -> EpisodeRow:
     return EpisodeRow(
         episode_id         = episode_id,
         start_event_ts     = start_event_ts,
         end_event_ts       = end_event_ts,
+        liq_count          = liq_count,
         liq_notional_total = liq_notional_total,
         min_mid_price      = min_mid_price,
         pre_event_vwap     = pre_event_vwap,
@@ -83,6 +99,7 @@ def make_episode(
         rebound_depth_bps  = rebound_depth_bps,
         price_at_5m        = price_at_5m,
         entry_price        = entry_price,
+        trade_count_0_15m  = trade_count_0_15m,
     )
 
 
@@ -531,10 +548,11 @@ class TestBuildReport:
 
             # 核心章节
             assert "【一】数据概况" in report
-            assert "【二】全局可交易模拟" in report
-            assert "【三】按盘口分组统计" in report
-            assert "【四】参数敏感性分析" in report
-            assert "【五】回弹质量分布" in report
+            assert "【二】样本合格性过滤" in report
+            assert "【三】全局可交易模拟" in report
+            assert "【四】按盘口分组统计" in report
+            assert "【五】参数敏感性分析" in report
+            assert "【六】回弹质量分布" in report
             # 不得只有混合统计（必须有分组）
             assert "美盘" in report
             assert "欧盘" in report
@@ -542,5 +560,133 @@ class TestBuildReport:
             assert "期望净收益" in report
             # 成交率应出现
             assert "成交率" in report
+            # 合格性章节必须存在
+            assert "【二】样本合格性过滤" in report
         finally:
             await db.close()
+
+
+# ── 19-28. qualify_episode / filter_qualified ─────────────────────────────────
+
+class TestQualifyEpisode:
+    """单条 episode 的静态合格性检查。"""
+
+    def test_fully_qualified_returns_empty(self):
+        """满足所有条件的 episode 返回空原因列表。"""
+        ep = make_episode()   # 所有默认值均满足条件
+        assert qualify_episode(ep) == []
+
+    def test_mae_bps_null_rejected(self):
+        """mae_bps IS NULL → 被拒绝。"""
+        ep = make_episode(mae_bps=None)
+        reasons = qualify_episode(ep)
+        assert any("mae_bps" in r for r in reasons)
+
+    def test_trade_count_low_rejected(self):
+        """trade_count_0_15m < 30 → 被拒绝。"""
+        ep = make_episode(trade_count_0_15m=10)
+        reasons = qualify_episode(ep)
+        assert any("trade_count_0_15m" in r for r in reasons)
+
+    def test_low_notional_rejected(self):
+        """liq_notional_total < 100,000 → 被拒绝。"""
+        ep = make_episode(liq_notional_total=50_000.0)
+        reasons = qualify_episode(ep)
+        assert any("liq_notional_total" in r for r in reasons)
+
+    def test_shallow_deviation_rejected(self):
+        """max_deviation_bps > -10（偏离过浅）→ 被拒绝。"""
+        ep = make_episode(max_deviation_bps=-5.0)
+        reasons = qualify_episode(ep)
+        assert any("max_deviation_bps" in r for r in reasons)
+
+    def test_low_liq_count_rejected(self):
+        """liq_count < 3 → 被拒绝。"""
+        ep = make_episode(liq_count=2)
+        reasons = qualify_episode(ep)
+        assert any("liq_count" in r for r in reasons)
+
+    def test_low_rebound_depth_rejected(self):
+        """rebound_depth_bps < 10 → 被拒绝。"""
+        ep = make_episode(rebound_depth_bps=5.0)
+        reasons = qualify_episode(ep)
+        assert any("rebound_depth_bps" in r for r in reasons)
+
+    def test_multiple_failures_all_reported(self):
+        """多个字段同时不合格时，所有原因均被记录。"""
+        ep = make_episode(mae_bps=None, liq_count=1, liq_notional_total=1_000.0)
+        reasons = qualify_episode(ep)
+        assert len(reasons) >= 3
+
+    def test_boundary_notional_exact(self):
+        """liq_notional_total == 100,000 → 正好在边界上，视为合格。"""
+        ep = make_episode(liq_notional_total=100_000.0)
+        assert qualify_episode(ep) == []
+
+    def test_boundary_deviation_exact(self):
+        """max_deviation_bps == -10 → 正好在边界上，视为合格。"""
+        ep = make_episode(max_deviation_bps=-10.0)
+        assert qualify_episode(ep) == []
+
+
+class TestFilterQualified:
+    """filter_qualified 的独立性检查和序列逻辑。"""
+
+    def test_all_qualified_no_gap_issue(self):
+        """时间间隔充足的多条 episode，全部通过。"""
+        eps = [
+            make_episode(
+                episode_id     = f"ep_{i}",
+                start_event_ts = BASE_TS_US + i * 2_000_000,   # 间隔 2000s
+                end_event_ts   = BASE_TS_US + i * 2_000_000 + 30_000,
+            )
+            for i in range(3)
+        ]
+        qualified, rejected = filter_qualified(eps)
+        assert len(qualified) == 3
+        assert len(rejected)  == 0
+
+    def test_independence_violation_rejected(self):
+        """两条 episode 间隔 < 900s → 第二条因独立性被拒绝。"""
+        ep1 = make_episode(
+            episode_id     = "ep_1",
+            start_event_ts = BASE_TS_US,
+            end_event_ts   = BASE_TS_US + 30_000,
+        )
+        ep2 = make_episode(
+            episode_id     = "ep_2",
+            start_event_ts = BASE_TS_US + 300_000,   # 仅 300s 后
+            end_event_ts   = BASE_TS_US + 330_000,
+        )
+        qualified, rejected = filter_qualified([ep1, ep2])
+        assert len(qualified) == 1
+        assert qualified[0].episode_id == "ep_1"
+        assert len(rejected) == 1
+        assert "independence" in rejected[0].reasons[0]
+
+    def test_disqualified_episode_does_not_block_next(self):
+        """
+        不合格的 episode 不占用独立性计时器：
+        ep1（合格）→ ep2（信号弱，静态不合格）→ ep3（合格，与 ep1 间隔足够）
+        ep3 应通过，独立性以 ep1 的 end_event_ts 为基准。
+        """
+        ep1 = make_episode(
+            episode_id     = "ep_1",
+            start_event_ts = BASE_TS_US,
+            end_event_ts   = BASE_TS_US + 30_000,
+        )
+        ep2 = make_episode(
+            episode_id        = "ep_2",
+            start_event_ts    = BASE_TS_US + 300_000,   # 5 分钟后
+            end_event_ts      = BASE_TS_US + 330_000,
+            liq_notional_total= 1_000.0,                # 静态不合格
+        )
+        ep3 = make_episode(
+            episode_id     = "ep_3",
+            start_event_ts = BASE_TS_US + 1_800_000,    # 30 分钟后（对 ep1 而言 >15min）
+            end_event_ts   = BASE_TS_US + 1_830_000,
+        )
+        qualified, rejected = filter_qualified([ep1, ep2, ep3])
+        assert len(qualified) == 2
+        assert [q.episode_id for q in qualified] == ["ep_1", "ep_3"]
+        assert rejected[0].episode_id == "ep_2"

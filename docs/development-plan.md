@@ -535,13 +535,21 @@
 
 ## 6. 当前建议的下一步
 
-建议按以下顺序推进：
+已完成（截至 2026-03-29）：
 
-1. 保持 Observe Mode 连续运行，积累至少 `20` 条有效 `episode` 样本
-2. 完成阶段 5 的可交易口径报告，主指标切换到 fill rate / net win rate / expectancy / MAE / MFE
-3. 将研究结论回写到策略、风控和状态文档，冻结 Shadow Mode 准入清单
-4. 仅在准入门槛满足后，才推进 Shadow Mode 参数扫描与虚拟撮合
+- 阶段 5 可交易口径报告已实现（fill rate / net win rate / expectancy / MAE / MFE / sensitivity table）
+- Shadow Mode 准入门槛已冻结为预注册文档（[reviews/shadow-mode-admission.md](reviews/shadow-mode-admission.md)），包含样本合格标准、统计门槛、参数选择规则
+- `price_at_episode_end` 字段已实装（消除入场价系统性乐观偏差）
+
+当前下一步：
+
+1. 保持 Observe Mode 连续运行，积累至少 `60` 条合格 episode 样本（跨越至少 `30` 个自然日）
+2. 样本达标后，运行 `qualify_episode` 过滤器，确认满足 [reviews/shadow-mode-admission.md](reviews/shadow-mode-admission.md) 第 3 节数量要求
+3. 运行 `research_report`，检查第 4 节统计条件（期望值 > -10 bps、至少一个时段正期望、无明显负边际时段）
+4. 若条件满足 → 按第 5 节鲁棒区间规则选参 → 写入配置冻结 → 进入 Shadow Mode
 5. Shadow Mode 验证通过后，再继续测试网执行链路与最小仓位实盘
+
+**准入文档是预注册文档，不允许以"数据与预期不符"为理由修改阈值。**
 
 ## 7. 文档维护原则
 

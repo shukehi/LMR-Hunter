@@ -132,6 +132,9 @@ LMR-Hunter 的风控目标不是消灭亏损，而是限制错误事件的破坏
 
 ## 9. 实盘上线门槛
 
+**进入 Shadow Mode 前的准入条件已预注册为独立文档，详见 [reviews/shadow-mode-admission.md](reviews/shadow-mode-admission.md)。**
+该文档包含：episode 合格性标准、最低样本量要求、统计准入条件、参数选择规则和 Shadow Mode 运行约束。准入阈值已在看到充分数据之前冻结，不允许以数据与预期不符为理由修改。
+
 满足以下条件之前，不允许进入实盘：
 
 1. `Observe Mode` 已连续运行至少 `72` 小时，且至少完成 `3` 次断线重连演练，每次在 `30` 秒内恢复

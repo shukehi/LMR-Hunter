@@ -8,8 +8,8 @@
   4. 聚合字段（peak、min_price、deviation）正确跟踪整个 episode
 
 额外验收：
-  5. 相邻事件间隔 > gap_ms 时拆分为两个独立 episode
-  6. episode 总持续 > max_duration_ms 时强制关闭
+  5. 相邻事件间隔 >= gap_ms 时拆分为两个独立 episode（含等于边界）
+  6. episode 总持续 >= max_duration_ms 时强制关闭（含等于边界）
   7. 统计计数（emitted / discarded / active）正确维护
   8. flush() 在系统关闭时正确关闭未完成的 episode
   9. pre_event_vwap 仅使用首笔事件的 VWAP（不被后续更新覆盖）

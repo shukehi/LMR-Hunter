@@ -39,9 +39,11 @@ CREATE TABLE IF NOT EXISTS raw_trades (
     symbol         TEXT    NOT NULL,
     price          REAL    NOT NULL,
     qty            REAL    NOT NULL,
-    is_buyer_maker INTEGER NOT NULL  -- 1=主动卖, 0=主动买
+    is_buyer_maker INTEGER NOT NULL,  -- 1=主动卖, 0=主动买
+    agg_id         INTEGER NOT NULL DEFAULT 0  -- aggTrade 序列号，严格递增，用于漏采检测
 );
-CREATE INDEX IF NOT EXISTS idx_trade_ts ON raw_trades(trade_ts);
+CREATE INDEX IF NOT EXISTS idx_trade_ts        ON raw_trades(trade_ts);
+CREATE INDEX IF NOT EXISTS idx_trade_symbol_ts ON raw_trades(symbol, trade_ts);  -- episode outcome 查询复合索引
 
 CREATE TABLE IF NOT EXISTS raw_klines (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,6 +179,18 @@ CREATE TABLE IF NOT EXISTS episode_outcomes (
 );
 CREATE INDEX IF NOT EXISTS idx_outcomes_episode ON episode_outcomes(episode_id);
 
+-- ── 盘口深度快照（1 秒降采样，用于研究 episode 期间流动性真空深度与补单速度）──────────
+
+CREATE TABLE IF NOT EXISTS raw_depth_snapshots (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    recv_ts   INTEGER NOT NULL,
+    event_ts  INTEGER NOT NULL,
+    symbol    TEXT    NOT NULL,
+    bids_json TEXT    NOT NULL,  -- JSON [[price, qty], ...] top 20 买档，高→低
+    asks_json TEXT    NOT NULL   -- JSON [[price, qty], ...] top 20 卖档，低→高
+);
+CREATE INDEX IF NOT EXISTS idx_depth_symbol_ts ON raw_depth_snapshots(symbol, event_ts);
+
 -- ── 风控与运维 ─────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS risk_events (
@@ -210,10 +224,101 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     """
     创建或打开 SQLite 数据库，执行所有 DDL，返回连接对象。
 
+    在 DDL 之后自动执行增量迁移（幂等），无需手动操作即可升级已有数据库。
     调用方负责在程序退出时关闭连接。
     """
     conn = await aiosqlite.connect(db_path)
     conn.row_factory = aiosqlite.Row
     await conn.executescript(_DDL)
     await conn.commit()
+
+    # ── 增量迁移（幂等，每次启动自动检查） ────────────────────────────────────
+    # v3: 为 raw_trades 增加 agg_id 列（若已存在则跳过）。
+    #     历史行保持 DEFAULT 0，不回填（历史 agg_id 已不可追溯）。
+    cursor = await conn.execute("PRAGMA table_info(raw_trades)")
+    trade_cols = {row[1] async for row in cursor}
+    if "agg_id" not in trade_cols:
+        await conn.execute(
+            "ALTER TABLE raw_trades ADD COLUMN agg_id INTEGER NOT NULL DEFAULT 0"
+        )
+        await conn.commit()
+
+    # v2: 为 episode_outcomes 增加 price_at_episode_end 列（若已存在则跳过），
+    #     并回填历史 NULL 值（从 raw_trades 取 end_event_ts 之后首笔成交价）。
+    cursor = await conn.execute("PRAGMA table_info(episode_outcomes)")
+    existing_cols = {row[1] async for row in cursor}
+    if "price_at_episode_end" not in existing_cols:
+        await conn.execute(
+            "ALTER TABLE episode_outcomes ADD COLUMN price_at_episode_end REAL"
+        )
+        await conn.commit()
+        # 回填历史行（仅在首次迁移时运行，避免每次启动都扫全表）。
+        # 上界限制为 end_event_ts + 15 分钟，与 get_trades_after_episode 的观测窗口一致，
+        # 防止"窗口内无成交但窗口外数小时后有成交"时回填值与实时计算值（None）不一致。
+        await conn.execute(
+            """
+            UPDATE episode_outcomes
+            SET    price_at_episode_end = (
+                       SELECT t.price
+                       FROM   raw_trades t
+                       JOIN   liquidation_episodes e
+                              ON e.episode_id = episode_outcomes.episode_id
+                       WHERE  t.symbol   = e.symbol
+                         AND  t.trade_ts >  e.end_event_ts
+                         AND  t.trade_ts <= e.end_event_ts + 900000
+                       ORDER  BY t.trade_ts, t.rowid
+                       LIMIT  1
+                   )
+            WHERE  price_at_episode_end IS NULL
+            """
+        )
+        await conn.commit()
+
+    # ── v4: 微观结构重构 — 新增列（幂等） ──────────────────────────────────────
+    # liquidation_episodes: pre_event_index_price, max_basis_bps, max_impact_ratio
+    cursor = await conn.execute("PRAGMA table_info(liquidation_episodes)")
+    ep_cols = {row[1] async for row in cursor}
+
+    for col, col_def in [
+        ("pre_event_index_price", "REAL"),
+        ("max_basis_bps", "REAL"),
+        ("max_impact_ratio", "REAL"),
+    ]:
+        if col not in ep_cols:
+            await conn.execute(
+                f"ALTER TABLE liquidation_episodes ADD COLUMN {col} {col_def}"
+            )
+            await conn.commit()
+
+    # episode_outcomes: rebound_to_basis_zero_ms, basis_rebound_depth
+    cursor = await conn.execute("PRAGMA table_info(episode_outcomes)")
+    oc_cols = {row[1] async for row in cursor}
+
+    for col, col_def in [
+        ("rebound_to_basis_zero_ms", "INTEGER"),
+        ("basis_rebound_depth", "REAL"),
+    ]:
+        if col not in oc_cols:
+            await conn.execute(
+                f"ALTER TABLE episode_outcomes ADD COLUMN {col} {col_def}"
+            )
+            await conn.commit()
+
+    # signals: index_price, basis_bps, bid_depth_usdt, impact_ratio
+    cursor = await conn.execute("PRAGMA table_info(signals)")
+    sig_cols = {row[1] async for row in cursor}
+
+    for col, col_def in [
+        ("index_price", "REAL"),
+        ("basis_bps", "REAL"),
+        ("bid_depth_usdt", "REAL"),
+        ("impact_ratio", "REAL"),
+    ]:
+        if col not in sig_cols:
+            await conn.execute(
+                f"ALTER TABLE signals ADD COLUMN {col} {col_def}"
+            )
+            await conn.commit()
+
     return conn
+

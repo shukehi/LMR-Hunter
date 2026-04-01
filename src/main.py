@@ -30,7 +30,7 @@ from src.features.calculator import FeatureCalculator
 from src.features.episode import EpisodeBuilder
 from src.features.outcome import compute_outcome
 from src.gateway.binance_ws import BinanceGateway
-from src.gateway.models import Depth, Kline, Liquidation, Trade
+from src.gateway.models import Depth, Kline, Liquidation, MarkPrice, Trade
 from src.gateway.rest_client import fetch_klines
 from src.monitor.alerts import AlertManager
 from src.storage import DatabaseWriter, init_db
@@ -99,13 +99,15 @@ async def on_liquidation(liq: Liquidation) -> None:
 
     snap = _calc.snapshot_at(liq.event_ts)
     logger.info(
-        "[BTC强平] %.0f USDT | 窗口=%.0f | 加速率=%s | VWAP=%s | 价格=%s | 偏离=%s bps | 盘口延迟=%s",
+        "[BTC强平] %.0f USDT | 窗口=%.0f | 加速率=%s | Index=%s | 中价=%s | "
+        "基差=%s bps | 冲击率=%s | 盘口延迟=%s",
         liq.notional,
         snap.liq_notional_window,
         f"{snap.liq_accel_ratio:.3f}" if snap.liq_accel_ratio is not None else "N/A",
-        f"{snap.vwap_15m:.2f}"        if snap.vwap_15m is not None else "冷启动",
-        f"{snap.mid_price:.2f}"       if snap.mid_price is not None else "N/A",
-        f"{snap.deviation_bps:.1f}"   if snap.deviation_bps is not None else "N/A",
+        f"{snap.index_price:.2f}"    if snap.index_price is not None else "冷启动",
+        f"{snap.mid_price:.2f}"      if snap.mid_price is not None else "N/A",
+        f"{snap.basis_bps:.1f}"      if snap.basis_bps is not None else "N/A",
+        f"{snap.impact_ratio:.3f}"   if snap.impact_ratio is not None else "N/A",
         f"{snap.depth_staleness_ms}ms" if snap.depth_staleness_ms is not None else "N/A",
     )
 
@@ -120,6 +122,9 @@ async def on_liquidation(liq: Liquidation) -> None:
             mid_price           = snap.mid_price,
             deviation_bps       = snap.deviation_bps,
             vwap_15m            = snap.vwap_15m,
+            index_price         = snap.index_price,
+            basis_bps           = snap.basis_bps,
+            impact_ratio        = snap.impact_ratio,
         )
         if completed_ep is not None:
             await _writer.write_episode(completed_ep)
@@ -135,10 +140,16 @@ async def on_liquidation(liq: Liquidation) -> None:
             deviation_bps=snap.deviation_bps,
             signal_fired=False,
             notes="observe_mode_btc_sell",
+            index_price=snap.index_price,
+            basis_bps=snap.basis_bps,
+            bid_depth_usdt=snap.bid_depth_usdt,
+            impact_ratio=snap.impact_ratio,
         )
 
 
 async def on_trade(trade: Trade) -> None:
+    if _calc is not None:
+        _calc.on_trade_flow(trade)
     if _writer is None:
         return
     _writer.enqueue_trade(trade)
@@ -148,6 +159,9 @@ async def on_depth(depth: Depth) -> None:
     if _calc is None:
         return
     _calc.update_mid_price(depth.mid_price, depth.event_ts)
+    _calc.update_bid_depth(depth.bid_depth_usdt, depth.event_ts)
+    if _writer is not None:
+        await _writer.write_depth(depth)
 
 
 async def on_kline(kline: Kline) -> None:
@@ -155,6 +169,12 @@ async def on_kline(kline: Kline) -> None:
         return
     _calc.on_kline(kline)
     await _writer.write_kline(kline)
+
+
+async def on_mark_price(mp: MarkPrice) -> None:
+    """标记价格事件：提取现货指数价格，更新 Feature Engine。"""
+    if _calc is not None:
+        _calc.update_index_price(mp.index_price, mp.event_ts)
 
 
 # ── 网关事件钩子（供告警使用）────────────────────────────────────────────────
@@ -233,10 +253,10 @@ async def stats_reporter(interval: int = 60) -> None:
         intg = _writer.integrity
 
         logger.info(
-            "[统计] 消息=%d | 强平=%d | 成交=%d | K线=%d | 盘口=%d | "
+            "[统计] 消息=%d | 强平=%d | 成交=%d | K线=%d | 盘口=%d | 标记价=%d | "
             "解析错误=%d | 重连=%d | 写入错误=%d",
             s["msg_total"], s["liquidations"], s["trades"],
-            s["klines"], s["depths"], s["parse_errors"],
+            s["klines"], s["depths"], s["mark_prices"], s["parse_errors"],
             s["reconnects"], wc["errors"],
         )
         logger.info(
@@ -305,6 +325,7 @@ async def outcome_processor() -> None:
                         entry_price    = ep["min_mid_price"],
                         pre_event_vwap = ep["pre_event_vwap"],
                         trades         = trades,
+                        pre_event_index_price = ep.get("pre_event_index_price"),
                     )
                     await _writer.write_episode_outcome(outcome)
         except Exception as e:
@@ -375,6 +396,7 @@ async def main() -> None:
         on_trade=on_trade,
         on_depth=on_depth,
         on_kline=on_kline,
+        on_mark_price=on_mark_price,
         on_disconnect=on_gateway_disconnect,
         on_reconnect=on_gateway_reconnect,
     )

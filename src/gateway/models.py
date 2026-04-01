@@ -66,6 +66,7 @@ class Trade:
     price: float
     qty: float
     is_buyer_maker: bool  # True=主动卖, False=主动买
+    agg_trade_id: int = 0  # aggTrade 序列号（"a" 字段），严格递增，用于检测漏采
 
     @classmethod
     def from_raw(cls, data: dict, recv_ts: int) -> Trade:
@@ -78,6 +79,7 @@ class Trade:
             price=float(data["p"]),
             qty=float(data["q"]),
             is_buyer_maker=bool(data["m"]),
+            agg_trade_id=int(data.get("a", 0)),
         )
 
 
@@ -113,6 +115,11 @@ class Depth:
     @property
     def mid_price(self) -> float:
         return (self.best_bid + self.best_ask) / 2
+
+    @property
+    def bid_depth_usdt(self) -> float:
+        """买盘总深度 (USDT) — 所有 bid 档位的名义价值之和，用于 Impact Ratio 计算。"""
+        return sum(price * qty for price, qty in self.bids)
 
 
 @dataclass(slots=True)
@@ -176,4 +183,30 @@ class Kline:
             close=float(row[4]),
             volume=float(row[5]),
             is_closed=close_ts < recv_ts,
+        )
+
+
+@dataclass(slots=True)
+class MarkPrice:
+    """标记价格事件（markPrice@1s）— 提供现货指数价格作为策略核心锚点。"""
+    recv_ts: int          # 本地收到时间戳 (ms)
+    event_ts: int         # 交易所事件时间戳 (ms)
+    symbol: str
+    mark_price: float     # 标记价格
+    index_price: float    # 现货指数价格（策略核心：公允价值锚点）
+    funding_rate: float   # 当前资金费率
+    next_funding_ts: int  # 下次资金费率时间
+
+    @classmethod
+    def from_raw(cls, data: dict, recv_ts: int) -> MarkPrice:
+        event_ts = int(data["E"])
+        _check_ts("MarkPrice.event_ts", event_ts, recv_ts)
+        return cls(
+            recv_ts=recv_ts,
+            event_ts=event_ts,
+            symbol=data["s"],
+            mark_price=float(data["p"]),
+            index_price=float(data["i"]),
+            funding_rate=float(data.get("r", "0")),
+            next_funding_ts=int(data.get("T", 0)),
         )

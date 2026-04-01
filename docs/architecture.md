@@ -75,15 +75,16 @@
 职责：
 
 - 计算滑动窗口强平聚合
-- 计算 `VWAP_15M` 基准价
-- 计算价格偏离率
-- 在启用时计算盘口深度摘要
+- 提取现货指数价格 (Index Price) 作为公允价值锚点
+- 计算期现基差 (Basis)
+- 结合 Orderbook 深度计算冲击比例 (Impact Ratio)
+- 结合成交流 (Taker Buy/Sell) 计算微观衰减特征
 
 ### 3.3 Signal Engine
 
 职责：
 
-- 组合事件层、偏离层，以及可选的流动性层信号
+- 组合事件层、流动性层、基差层和微观衰减层信号
 - 判断是否生成交易意图
 - 生成标准化信号对象
 
@@ -216,10 +217,8 @@ MVP 的研究前提：
 
 - 不依赖交易所提供的全市场历史强平查询能力
 - 通过自建实时仓库沉淀研究数据
-
-`P3` 增强能力：
-
-- 盘口深度流
+- 盘口深度流（`depth20@100ms`）— 用于买盘深度 (bid_depth_usdt) 和 Impact Ratio 计算
+- 标记/指数价格流（`markPrice@1s`）— 用于 Index Price 和 Basis 计算
 
 ### 7.2 账户能力
 
@@ -314,9 +313,9 @@ Observe Mode 优化阶段新增（已落地）：
 - 交易所事件时间
 - 本地接收时间
 - 当前价格
-- 基准价格
-- 偏离率
-- 盘口深度摘要（若启用）
+- 基准价格 (Index Price)
+- 基差 (Basis)
+- 冲击比例 (Impact Ratio)
 - 理论挂单价
 - 实际挂单价
 - 挂单延迟
@@ -381,7 +380,7 @@ MVP 使用 `Python 3.11+`。
 |------|------|------|
 | `ccxt` | 交易所抽象层 | 若需快速接入可用，但建议首版直连 Binance API 以控制行为 |
 | `pandas` | 回放与参数研究 | 阶段 2 影子模式分析 |
-| `numpy` | VWAP 和统计计算 | 阶段 2 |
+| `numpy` | 统计计算 | 阶段 2 |
 
 ### 9.3 项目结构建议
 
@@ -488,7 +487,7 @@ lmr-hunter/
 
 - `estimated_latency_ms`：配置在参数文件中，Shadow Mode 使用此值做延迟惩罚
 - Observe Mode 阶段持续采集实际延迟分布（P50, P95, P99）
-- 若实际延迟显著偏离配置值，应触发告警
+- 若实际延迟显著大于配置值，应触发告警
 - 部署后首要任务：实测 WebSocket 连接延迟，确认实际延迟 < 50ms
 
 ### 10.6 VPS 部署前置确认
@@ -524,6 +523,10 @@ lmr-hunter/
 - [文档地图](index.md)
 - [项目状态](status.md)
 - [术语表](glossary.md)
+- [策略文档](strategy.md)
+- [风控文档](risk-controls.md)
+- [开发计划](development-plan.md)
+.md)
 - [策略文档](strategy.md)
 - [风控文档](risk-controls.md)
 - [开发计划](development-plan.md)

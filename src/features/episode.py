@@ -48,8 +48,12 @@ class LiquidationEpisode:
     liq_peak_window:      float         # episode 期间最高滚动窗口值 (USDT)
     liq_accel_ratio_peak: float | None  # episode 期间最高加速率（None = 无可用数据）
     min_mid_price:        float | None  # episode 期间盘口中间价最低值（最深跌点）
-    pre_event_vwap:       float | None  # 首笔强平时的 VWAP（None = 冷启动期间）
-    max_deviation_bps:    float | None  # episode 期间最大负偏离 bps（数值最小）
+    pre_event_vwap:       float | None  # [DEPRECATED] 首笔强平时的 VWAP
+    max_deviation_bps:    float | None  # [DEPRECATED] episode 期间最大负偏离 bps
+    # 微观结构重构新增
+    pre_event_index_price: float | None  # 首笔强平时的现货指数价格
+    max_basis_bps:         float | None  # episode 期间最深负基差 (bps)
+    max_impact_ratio:      float | None  # episode 期间最大冲击比例
 
 
 # ── 内部状态（不对外暴露）────────────────────────────────────────────────────────
@@ -64,6 +68,7 @@ class _ActiveEpisode:
         "liq_peak_window", "liq_accel_ratio_peak",
         "min_mid_price", "pre_event_vwap",
         "max_deviation_bps",
+        "pre_event_index_price", "max_basis_bps", "max_impact_ratio",
     )
 
     def __init__(self, symbol: str, side: str, start_event_ts: int) -> None:
@@ -76,8 +81,12 @@ class _ActiveEpisode:
         self.liq_peak_window      = 0.0
         self.liq_accel_ratio_peak: float | None = None
         self.min_mid_price:        float | None = None
-        self.pre_event_vwap:       float | None = None   # 首笔强平时的 VWAP，之后不再更新
-        self.max_deviation_bps:    float | None = None   # 跟踪最大超跌（最小的 bps 值）
+        self.pre_event_vwap:       float | None = None
+        self.max_deviation_bps:    float | None = None
+        # 微观结构重构新增
+        self.pre_event_index_price: float | None = None
+        self.max_basis_bps:         float | None = None
+        self.max_impact_ratio:      float | None = None
 
     def update(
         self,
@@ -88,6 +97,9 @@ class _ActiveEpisode:
         mid_price:           float | None,
         deviation_bps:       float | None,
         vwap_15m:            float | None,
+        index_price:         float | None = None,
+        basis_bps:           float | None = None,
+        impact_ratio:        float | None = None,
     ) -> None:
         """将一笔强平事件合并入当前 episode。"""
         self.last_event_ts       = event_ts
@@ -117,6 +129,20 @@ class _ActiveEpisode:
         if self.liq_count == 1 and vwap_15m is not None:
             self.pre_event_vwap = vwap_15m
 
+        # 微观结构新增：pre_event_index_price 只记录首笔事件
+        if self.liq_count == 1 and index_price is not None:
+            self.pre_event_index_price = index_price
+
+        # 最深负基差（数值最小的 basis_bps）
+        if basis_bps is not None:
+            if self.max_basis_bps is None or basis_bps < self.max_basis_bps:
+                self.max_basis_bps = basis_bps
+
+        # 最大冲击比例
+        if impact_ratio is not None:
+            if self.max_impact_ratio is None or impact_ratio > self.max_impact_ratio:
+                self.max_impact_ratio = impact_ratio
+
     def to_episode(self) -> LiquidationEpisode:
         return LiquidationEpisode(
             episode_id           = f"{self.symbol}_{self.start_event_ts}",
@@ -132,6 +158,9 @@ class _ActiveEpisode:
             min_mid_price        = self.min_mid_price,
             pre_event_vwap       = self.pre_event_vwap,
             max_deviation_bps    = self.max_deviation_bps,
+            pre_event_index_price = self.pre_event_index_price,
+            max_basis_bps         = self.max_basis_bps,
+            max_impact_ratio      = self.max_impact_ratio,
         )
 
 
@@ -207,6 +236,9 @@ class EpisodeBuilder:
         mid_price:           float | None,
         deviation_bps:       float | None,
         vwap_15m:            float | None,
+        index_price:         float | None = None,
+        basis_bps:           float | None = None,
+        impact_ratio:        float | None = None,
     ) -> LiquidationEpisode | None:
         """
         喂入一笔强平事件。
@@ -240,6 +272,9 @@ class EpisodeBuilder:
             mid_price           = mid_price,
             deviation_bps       = deviation_bps,
             vwap_15m            = vwap_15m,
+            index_price         = index_price,
+            basis_bps           = basis_bps,
+            impact_ratio        = impact_ratio,
         )
 
         return completed

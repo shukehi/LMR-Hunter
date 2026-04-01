@@ -179,3 +179,58 @@ def test_price_at_episode_end_independent_of_entry_price():
     oc = compute_outcome("EP_1", BASE_TS, None, 86_000.0, trades)
     assert oc.price_at_episode_end == pytest.approx(83_000.0)
     assert oc.mae_bps is None   # entry=None 时 MAE 不可计算
+
+
+# ── get_trades_after_episode 边界测试 ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_get_trades_after_episode_excludes_episode_end_ts():
+    """
+    关键边界测试：trade_ts == end_event_ts 的成交不应被 get_trades_after_episode 返回。
+
+    旧代码使用 BETWEEN（含起点），会把 episode 最后一笔成交误认为"episode 结束后首笔"，
+    导致 price_at_episode_end 偏低（仍是下跌期的价格）。
+    新代码使用 trade_ts > start_ts（严格排他），与 schema 回填逻辑一致。
+    """
+    import aiosqlite
+    END_TS = BASE_TS + 5_000
+
+    async with aiosqlite.connect(":memory:") as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.executescript("""
+            CREATE TABLE raw_trades (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                recv_ts        INTEGER NOT NULL,
+                trade_ts       INTEGER NOT NULL,
+                symbol         TEXT    NOT NULL,
+                price          REAL    NOT NULL,
+                qty            REAL    NOT NULL,
+                is_buyer_maker INTEGER NOT NULL,
+                agg_id         INTEGER NOT NULL DEFAULT 0
+            );
+        """)
+
+        # 在 episode 期间（含末尾时刻）的成交 — 不应被返回
+        await conn.execute(
+            "INSERT INTO raw_trades (recv_ts, trade_ts, symbol, price, qty, is_buyer_maker) "
+            "VALUES (?, ?, 'BTCUSDT', 83000.0, 0.1, 0)",
+            (END_TS, END_TS),
+        )
+        # episode 结束后的第一笔真实成交 — 应被返回且作为 price_at_episode_end
+        await conn.execute(
+            "INSERT INTO raw_trades (recv_ts, trade_ts, symbol, price, qty, is_buyer_maker) "
+            "VALUES (?, ?, 'BTCUSDT', 84000.0, 0.1, 0)",
+            (END_TS + 1, END_TS + 1),
+        )
+        await conn.commit()
+
+        from src.storage.writer import DatabaseWriter
+        writer = DatabaseWriter(conn)
+        trades = await writer.get_trades_after_episode(
+            symbol   = "BTCUSDT",
+            start_ts = END_TS,
+            end_ts   = END_TS + 900_000,
+        )
+
+    assert len(trades) == 1, "episode 末尾时刻的成交不应包含在内"
+    assert trades[0][1] == pytest.approx(84_000.0), "第一笔应为 episode 结束后的成交"

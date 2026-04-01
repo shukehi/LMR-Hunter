@@ -25,7 +25,7 @@ import orjson
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from src.gateway.models import Depth, Kline, Liquidation, Trade
+from src.gateway.models import Depth, Kline, Liquidation, MarkPrice, Trade
 from src.utils.logger import setup_logger
 
 logger = setup_logger("gateway")
@@ -37,6 +37,7 @@ _STREAMS = [
     "btcusdt@aggTrade",
     "btcusdt@depth20@100ms",
     "btcusdt@kline_1m",
+    "btcusdt@markPrice@1s",
 ]
 _WS_URL = f"{_WS_BASE}?streams=" + "/".join(_STREAMS)
 
@@ -53,6 +54,7 @@ OnLiquidation = Callable[[Liquidation], Awaitable[None]]
 OnTrade       = Callable[[Trade],       Awaitable[None]]
 OnDepth       = Callable[[Depth],       Awaitable[None]]
 OnKline       = Callable[[Kline],       Awaitable[None]]
+OnMarkPrice   = Callable[[MarkPrice],   Awaitable[None]]
 OnEvent       = Callable[[],            Awaitable[None]]   # 无参事件（断线/重连）
 
 
@@ -68,6 +70,7 @@ class BinanceGateway:
         on_trade:       OnTrade,
         on_depth:       OnDepth,
         on_kline:       OnKline,
+        on_mark_price:  OnMarkPrice | None = None,
         on_disconnect:  OnEvent | None = None,
         on_reconnect:   OnEvent | None = None,
     ) -> None:
@@ -75,6 +78,7 @@ class BinanceGateway:
         self._on_trade       = on_trade
         self._on_depth       = on_depth
         self._on_kline       = on_kline
+        self._on_mark_price  = on_mark_price
         self._on_disconnect  = on_disconnect
         self._on_reconnect   = on_reconnect
         self._running        = False
@@ -87,6 +91,7 @@ class BinanceGateway:
             "trades":       0,
             "depths":       0,
             "klines":       0,
+            "mark_prices":  0,
             "parse_errors": 0,
             "reconnects":   0,
         }
@@ -192,6 +197,8 @@ class BinanceGateway:
                     await self._handle_depth(data, recv_ts)
                 elif "@kline_" in stream:
                     await self._handle_kline(data, recv_ts)
+                elif "@markPrice" in stream:
+                    await self._handle_mark_price(data, recv_ts)
 
             except Exception as e:  # noqa: BLE001
                 self.stats["parse_errors"] += 1
@@ -233,3 +240,11 @@ class BinanceGateway:
                 kline.symbol, kline.close, kline.volume,
             )
         await self._on_kline(kline)
+
+    async def _handle_mark_price(self, data: dict, recv_ts: int) -> None:
+        mp = MarkPrice.from_raw(data, recv_ts)
+        latency = recv_ts - mp.event_ts
+        self._latency_samples.append(latency)
+        self.stats["mark_prices"] += 1
+        if self._on_mark_price is not None:
+            await self._on_mark_price(mp)

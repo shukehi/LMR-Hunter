@@ -2,6 +2,7 @@
 Binance Futures REST 客户端。
 
 当前用途：启动时拉取最近 N 根 1m K 线，为 VWAP 计算提供冷启动数据。
+         数据审计：拉取历史强平订单，与 WebSocket 采集结果交叉核对。
 后续阶段：下单/撤单/查询也通过此模块实现。
 """
 from __future__ import annotations

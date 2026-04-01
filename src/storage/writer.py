@@ -30,7 +30,7 @@ import aiosqlite
 
 from src.features.episode import LiquidationEpisode
 from src.features.outcome import EpisodeOutcome
-from src.gateway.models import Kline, Liquidation, Trade
+from src.gateway.models import Depth, Kline, Liquidation, Trade
 from src.utils.logger import setup_logger
 
 logger = setup_logger("storage.writer")
@@ -58,6 +58,7 @@ class DatabaseWriter:
         self._trade_queue:       deque[Trade] = deque(maxlen=trade_queue_maxlen)
         self._trade_batch_size   = trade_batch_size
         self._isolation_dir      = isolation_dir
+        self._last_depth_ts: int = 0   # 深度快照降采样：记录上次写入的 event_ts
 
         # ── 完整性计数器 ──────────────────────────────────────────────────────────
         # overflow_dropped : 队列溢出，最旧样本被 deque 自动覆盖（直接丢失）
@@ -78,6 +79,7 @@ class DatabaseWriter:
             "liquidations": 0,
             "trades":       0,
             "klines":       0,
+            "depths":       0,
             "signals":      0,
             "episodes":     0,
             "outcomes":     0,
@@ -214,7 +216,7 @@ class DatabaseWriter:
         batch_size   = min(len(self._trade_queue), self._trade_batch_size)
         batch_trades = [self._trade_queue[i] for i in range(batch_size)]
         batch_rows   = [
-            (t.recv_ts, t.trade_ts, t.symbol, t.price, t.qty, int(t.is_buyer_maker))
+            (t.recv_ts, t.trade_ts, t.symbol, t.price, t.qty, int(t.is_buyer_maker), t.agg_trade_id)
             for t in batch_trades
         ]
 
@@ -225,8 +227,8 @@ class DatabaseWriter:
                 await self._conn.executemany(
                     """
                     INSERT INTO raw_trades
-                        (recv_ts, trade_ts, symbol, price, qty, is_buyer_maker)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (recv_ts, trade_ts, symbol, price, qty, is_buyer_maker, agg_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     batch_rows,
                 )
@@ -285,6 +287,28 @@ class DatabaseWriter:
             )
 
         return 0
+
+    # ── 盘口深度快照 ────────────────────────────────────────────────────────────
+
+    async def write_depth(self, depth: Depth) -> None:
+        """写入盘口深度快照（1 秒降采样：同一 symbol 两次写入间隔 < 1000ms 则跳过）。"""
+        if depth.event_ts - self._last_depth_ts < 1000:
+            return
+        self._last_depth_ts = depth.event_ts
+        try:
+            await self._conn.execute(
+                """
+                INSERT INTO raw_depth_snapshots (recv_ts, event_ts, symbol, bids_json, asks_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (depth.recv_ts, depth.event_ts, depth.symbol,
+                 json.dumps(depth.bids), json.dumps(depth.asks)),
+            )
+            await self._conn.commit()
+            self._write_counts["depths"] += 1
+        except Exception as e:
+            self._write_counts["errors"] += 1
+            logger.error("写入深度快照失败: %s", e)
 
     # ── K 线 ──────────────────────────────────────────────────────────────────
 
@@ -422,6 +446,10 @@ class DatabaseWriter:
         signal_fired: bool = False,
         entry_price: float | None = None,
         notes: str | None = None,
+        index_price: float | None = None,
+        basis_bps: float | None = None,
+        bid_depth_usdt: float | None = None,
+        impact_ratio: float | None = None,
     ) -> int:
         """写入信号记录，返回新插入的 id。"""
         try:
@@ -430,12 +458,14 @@ class DatabaseWriter:
                 INSERT INTO signals
                     (ts, symbol, liq_notional_window, liq_accel_ratio,
                      vwap_15m, mid_price, deviation_bps, signal_fired,
-                     entry_price, notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     entry_price, notes,
+                     index_price, basis_bps, bid_depth_usdt, impact_ratio)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (ts, symbol, liq_notional_window, liq_accel_ratio,
                  vwap_15m, mid_price, deviation_bps,
-                 int(signal_fired), entry_price, notes),
+                 int(signal_fired), entry_price, notes,
+                 index_price, basis_bps, bid_depth_usdt, impact_ratio),
             )
             await self._conn.commit()
             self._write_counts["signals"] += 1
@@ -459,8 +489,10 @@ class DatabaseWriter:
                      start_event_ts, end_event_ts, duration_ms,
                      liq_count, liq_notional_total, liq_peak_window,
                      liq_accel_ratio_peak, min_mid_price,
-                     pre_event_vwap, max_deviation_bps, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     pre_event_vwap, max_deviation_bps,
+                     pre_event_index_price, max_basis_bps, max_impact_ratio,
+                     created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     episode.episode_id,  episode.symbol,  episode.side,
@@ -468,6 +500,8 @@ class DatabaseWriter:
                     episode.liq_count,   episode.liq_notional_total, episode.liq_peak_window,
                     episode.liq_accel_ratio_peak, episode.min_mid_price,
                     episode.pre_event_vwap, episode.max_deviation_bps,
+                    episode.pre_event_index_price, episode.max_basis_bps,
+                    episode.max_impact_ratio,
                     int(time.time() * 1000),
                 ),
             )
@@ -475,13 +509,14 @@ class DatabaseWriter:
             self._write_counts["episodes"] += 1
             logger.info(
                 "[Episode] %s | %d 笔 | 总量=%.0f USDT | 峰值窗口=%.0f | 持续=%dms | "
-                "最深=%.0f | 偏离=%s bps",
+                "基差=%s bps | 冲击率=%s | 偏离=%s bps",
                 episode.episode_id,
                 episode.liq_count,
                 episode.liq_notional_total,
                 episode.liq_peak_window,
                 episode.duration_ms,
-                episode.min_mid_price or 0,
+                f"{episode.max_basis_bps:.1f}" if episode.max_basis_bps is not None else "N/A",
+                f"{episode.max_impact_ratio:.3f}" if episode.max_impact_ratio is not None else "N/A",
                 f"{episode.max_deviation_bps:.1f}" if episode.max_deviation_bps is not None else "N/A",
             )
             return cursor.lastrowid or 0
@@ -499,7 +534,8 @@ class DatabaseWriter:
         cutoff = int(time.time() * 1000) - min_age_ms
         rows = await (await self._conn.execute(
             """
-            SELECT e.episode_id, e.end_event_ts, e.min_mid_price, e.pre_event_vwap, e.symbol
+            SELECT e.episode_id, e.end_event_ts, e.min_mid_price, e.pre_event_vwap,
+                   e.symbol, e.pre_event_index_price
             FROM   liquidation_episodes e
             LEFT   JOIN episode_outcomes o ON e.episode_id = o.episode_id
             WHERE  o.episode_id IS NULL
@@ -513,12 +549,17 @@ class DatabaseWriter:
     async def get_trades_after_episode(
         self, symbol: str, start_ts: int, end_ts: int
     ) -> list[tuple[int, float]]:
-        """返回指定时间窗口内的成交序列 [(trade_ts, price), ...]，按 trade_ts 升序。"""
+        """返回 episode 结束后 15 分钟内的成交序列 [(trade_ts, price), ...]，按 trade_ts 升序。
+
+        start_ts 语义为 episode 的 end_event_ts（严格排他，即 > start_ts），
+        end_ts 为观测窗口末端（含）。
+        不使用 BETWEEN 以避免 trades[0] 误取到 episode 最后一笔成交（同一毫秒）。
+        """
         rows = await (await self._conn.execute(
             """
             SELECT trade_ts, price FROM raw_trades
-            WHERE  symbol = ? AND trade_ts BETWEEN ? AND ?
-            ORDER  BY trade_ts
+            WHERE  symbol = ? AND trade_ts > ? AND trade_ts <= ?
+            ORDER  BY trade_ts, rowid
             """,
             (symbol, start_ts, end_ts),
         )).fetchall()
@@ -536,8 +577,10 @@ class DatabaseWriter:
                      min_price_0_15m, max_price_0_15m,
                      mae_bps, mfe_bps,
                      rebound_to_vwap_ms, rebound_depth_bps,
-                     trade_count_0_15m, computed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     trade_count_0_15m,
+                     rebound_to_basis_zero_ms, basis_rebound_depth,
+                     computed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     outcome.episode_id,          outcome.entry_price,
@@ -548,21 +591,24 @@ class DatabaseWriter:
                     outcome.mae_bps,              outcome.mfe_bps,
                     outcome.rebound_to_vwap_ms,   outcome.rebound_depth_bps,
                     outcome.trade_count_0_15m,
+                    outcome.rebound_to_basis_zero_ms, outcome.basis_rebound_depth,
                     int(time.time() * 1000),
                 ),
             )
             await self._conn.commit()
             self._write_counts["outcomes"] += 1
             rebound_str = (
-                f"{outcome.rebound_to_vwap_ms // 1000}s"
-                if outcome.rebound_to_vwap_ms is not None else "未反弹"
+                f"{outcome.rebound_to_basis_zero_ms // 1000}s"
+                if outcome.rebound_to_basis_zero_ms is not None else "未回归"
             )
             logger.info(
-                "[Outcome] %s | MAE=%s bps | MFE=%s bps | 反弹到VWAP=%s | 成交=%d笔",
+                "[Outcome] %s | MAE=%s bps | MFE=%s bps | 基差回归=%s | "
+                "基差距离=%s bps | 成交=%d笔",
                 outcome.episode_id,
                 f"{outcome.mae_bps:.1f}" if outcome.mae_bps is not None else "N/A",
                 f"{outcome.mfe_bps:.1f}" if outcome.mfe_bps is not None else "N/A",
                 rebound_str,
+                f"{outcome.basis_rebound_depth:.1f}" if outcome.basis_rebound_depth is not None else "N/A",
                 outcome.trade_count_0_15m,
             )
         except Exception as e:

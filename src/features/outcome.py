@@ -30,6 +30,7 @@ class EpisodeOutcome:
     一次 episode 的完整 outcome 观测记录。
 
     使用说明：
+      - 可下单最早价格：price_at_episode_end（episode 结束后首笔成交价，None = 无成交）
       - 验证反弹是否发生：rebound_to_vwap_ms is not None
       - 验证反弹延迟：rebound_to_vwap_ms / 1000 秒
       - 验证 MAE（止损参考）：mae_bps（越负越差）
@@ -48,9 +49,12 @@ class EpisodeOutcome:
     max_price_0_15m:     float | None   # 0-15 分钟最高价
     mae_bps:             float | None   # 最大不利偏移（0-5m，负值 = 入场后价格进一步下跌）
     mfe_bps:             float | None   # 最大有利偏移（0-5m，正值 = 入场后价格上涨空间）
-    rebound_to_vwap_ms:  int   | None   # 价格首次 >= pre_event_vwap 的延迟；None = 15m 内未反弹
-    rebound_depth_bps:   float | None   # 从 entry 到 pre_event_vwap 的距离（bps），即反弹目标
-    trade_count_0_15m:   int            # 15 分钟内成交总笔数（数据密度参考）
+    rebound_to_vwap_ms:  int   | None   # [DEPRECATED] 价格首次 >= pre_event_vwap 的延迟
+    rebound_depth_bps:   float | None   # [DEPRECATED] 从 entry 到 pre_event_vwap 的距离
+    trade_count_0_15m:   int            # 15 分钟内成交总笔数
+    # 微观结构重构新增
+    rebound_to_basis_zero_ms: int   | None  # 基差首次回归 0 附近的延迟 (ms)
+    basis_rebound_depth:      float | None  # index_price 与 entry_price 的距离 (bps)
 
 
 def compute_outcome(
@@ -59,6 +63,7 @@ def compute_outcome(
     entry_price:    float | None,
     pre_event_vwap: float | None,
     trades:         list[tuple[int, float]],  # [(trade_ts, price), ...] 升序
+    pre_event_index_price: float | None = None,
 ) -> EpisodeOutcome:
     """
     从 episode 结束后 15 分钟内的成交序列计算 outcome。
@@ -112,25 +117,39 @@ def compute_outcome(
                 rebound_ms = ts - end_event_ts
                 break
 
-    # 反弹幅度（entry → vwap 的距离，bps）
     rebound_depth: float | None = None
     if entry_price is not None and entry_price > 0 and pre_event_vwap is not None:
         rebound_depth = round((pre_event_vwap - entry_price) / entry_price * 10_000, 1)
+
+    # 微观结构重构：基差回归带来的反弹距离和延迟
+    basis_rebound: float | None = None
+    if entry_price is not None and entry_price > 0 and pre_event_index_price is not None:
+        basis_rebound = round((pre_event_index_price - entry_price) / entry_price * 10_000, 1)
+
+    # 基差回归到 0 的延迟（价格首次 >= pre_event_index_price）
+    basis_zero_ms: int | None = None
+    if pre_event_index_price is not None:
+        for ts, p in trades_0_15m:
+            if p >= pre_event_index_price:
+                basis_zero_ms = ts - end_event_ts
+                break
 
     return EpisodeOutcome(
         episode_id           = episode_id,
         entry_price          = entry_price,
         price_at_episode_end = price_at_episode_end,
         price_at_1m          = price_at_1m,
-        price_at_5m         = price_at_5m,
-        price_at_15m        = price_at_15m,
-        min_price_0_5m      = min_5m,
-        max_price_0_5m      = max_5m,
-        min_price_0_15m     = min_15m,
-        max_price_0_15m     = max_15m,
-        mae_bps             = mae,
-        mfe_bps             = mfe,
-        rebound_to_vwap_ms  = rebound_ms,
-        rebound_depth_bps   = rebound_depth,
-        trade_count_0_15m   = n,
+        price_at_5m          = price_at_5m,
+        price_at_15m         = price_at_15m,
+        min_price_0_5m       = min_5m,
+        max_price_0_5m       = max_5m,
+        min_price_0_15m      = min_15m,
+        max_price_0_15m      = max_15m,
+        mae_bps              = mae,
+        mfe_bps              = mfe,
+        rebound_to_vwap_ms   = rebound_ms,
+        rebound_depth_bps    = rebound_depth,
+        trade_count_0_15m    = n,
+        rebound_to_basis_zero_ms = basis_zero_ms,
+        basis_rebound_depth      = basis_rebound,
     )

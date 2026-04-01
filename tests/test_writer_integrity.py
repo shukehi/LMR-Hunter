@@ -169,3 +169,61 @@ class TestTradeIntegrity:
         assert writer.is_degraded is True
         # discarded = isolated（DB 失败 → 已写隔离文件）= 3
         assert writer.integrity["discarded"] == 3
+
+
+# ── write_depth 节流与写入 ────────────────────────────────────────────────────
+
+class TestWriteDepth:
+
+    def _make_depth(self, event_ts: int):
+        from src.gateway.models import Depth
+        return Depth(
+            recv_ts=event_ts + 5,
+            event_ts=event_ts,
+            symbol="BTCUSDT",
+            bids=[(68000.0, 1.0), (67999.0, 2.0)],
+            asks=[(68001.0, 1.0), (68002.0, 2.0)],
+        )
+
+    async def _make_writer(self, tmp_path):
+        import aiosqlite
+        conn = MagicMock(spec=aiosqlite.Connection)
+        conn.execute = AsyncMock(return_value=MagicMock())
+        conn.commit  = AsyncMock(return_value=None)
+        return DatabaseWriter(conn, isolation_dir=tmp_path / "iso"), conn
+
+    @pytest.mark.asyncio
+    async def test_write_depth_increments_counter(self, tmp_path):
+        """第一次调用应写入并递增 depths 计数。"""
+        writer, conn = await self._make_writer(tmp_path)
+        await writer.write_depth(self._make_depth(1_700_000_000_000))
+        assert writer.counts["depths"] == 1
+        conn.execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_write_depth_throttle_skips_within_1s(self, tmp_path):
+        """同一 symbol 两次调用间隔 < 1000ms 时第二次应被跳过。"""
+        writer, conn = await self._make_writer(tmp_path)
+        base = 1_700_000_000_000
+        await writer.write_depth(self._make_depth(base))
+        await writer.write_depth(self._make_depth(base + 500))   # 500ms later → skip
+        assert writer.counts["depths"] == 1
+        assert conn.execute.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_write_depth_allows_after_1s(self, tmp_path):
+        """间隔 >= 1000ms 时第二次应正常写入。"""
+        writer, conn = await self._make_writer(tmp_path)
+        base = 1_700_000_000_000
+        await writer.write_depth(self._make_depth(base))
+        await writer.write_depth(self._make_depth(base + 1000))  # exactly 1000ms → allow
+        assert writer.counts["depths"] == 2
+
+    @pytest.mark.asyncio
+    async def test_write_depth_error_increments_error_counter(self, tmp_path):
+        """写入失败时 errors 计数递增，depths 不递增。"""
+        writer, conn = await self._make_writer(tmp_path)
+        conn.execute = AsyncMock(side_effect=Exception("DB error"))
+        await writer.write_depth(self._make_depth(1_700_000_000_000))
+        assert writer.counts["depths"] == 0
+        assert writer.counts["errors"] == 1

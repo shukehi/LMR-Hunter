@@ -179,6 +179,23 @@ CREATE TABLE IF NOT EXISTS episode_outcomes (
 );
 CREATE INDEX IF NOT EXISTS idx_outcomes_episode ON episode_outcomes(episode_id);
 
+-- ── 标记价格 / 现货指数原始流（每秒 1 条，basis_bps 可审计的唯一来源）──────────────────
+-- 设计原则：
+--   - 这是 basis_bps 的"源头事实"，不允许用任何代理值替代
+--   - basis_bps 为预计算冗余列（可由 mark_price / index_price 推导），保留以加速查询
+--   - 任何 episode / signal / outcome 都可通过 JOIN 此表重建其发生时刻的 basis
+
+CREATE TABLE IF NOT EXISTS raw_mark_prices (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    recv_ts     INTEGER NOT NULL,   -- 本地收到时间戳 (ms)
+    event_ts    INTEGER NOT NULL,   -- 交易所事件时间戳 (ms)
+    symbol      TEXT    NOT NULL,
+    mark_price  REAL    NOT NULL,   -- 标记价格（参考价，用于强平判定）
+    index_price REAL    NOT NULL,   -- 现货指数价格（公允价值锚点）
+    basis_bps   REAL    NOT NULL    -- (mark_price - index_price) / index_price × 10000（预计算冗余列）
+);
+CREATE INDEX IF NOT EXISTS idx_mark_price_symbol_ts ON raw_mark_prices(symbol, event_ts);
+
 -- ── 盘口深度快照（1 秒降采样，用于研究 episode 期间流动性真空深度与补单速度）──────────
 
 CREATE TABLE IF NOT EXISTS raw_depth_snapshots (
@@ -319,6 +336,23 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
                 f"ALTER TABLE signals ADD COLUMN {col} {col_def}"
             )
             await conn.commit()
+
+    # ── v5: raw_mark_prices 表（index_price 原始持久化，basis_bps 可审计基础）────────
+    # 使用 CREATE TABLE IF NOT EXISTS，对已有表完全幂等，对存量 DB 一次性建表
+    await conn.executescript("""
+        CREATE TABLE IF NOT EXISTS raw_mark_prices (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            recv_ts     INTEGER NOT NULL,
+            event_ts    INTEGER NOT NULL,
+            symbol      TEXT    NOT NULL,
+            mark_price  REAL    NOT NULL,
+            index_price REAL    NOT NULL,
+            basis_bps   REAL    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mark_price_symbol_ts
+            ON raw_mark_prices(symbol, event_ts);
+    """)
+    await conn.commit()
 
     return conn
 

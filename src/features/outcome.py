@@ -6,14 +6,24 @@ Episode outcome 计算引擎（纯计算，无 I/O）。
   - price_at_episode_end = episode 结束后第一笔真实成交价（最早可下单时刻的市场价格）
   - MAE（最大不利偏移）   = 入场后 0-5 分钟最低价 vs entry（负值 = 亏损深度）
   - MFE（最大有利偏移）   = 入场后 0-5 分钟最高价 vs entry（正值 = 潜在盈利空间）
-  - rebound_to_vwap_ms   = 价格首次回到 pre_event_vwap 的延迟（衡量修复速度）
-  - rebound_depth_bps    = (pre_event_vwap - entry) / entry × 10000（反弹目标距离）
+
+  【Phase 4 修复】rebound_to_basis_zero_ms 语义修正：
+    旧（错误近似）：perp_price >= pre_event_index_price（固定价格阈值）
+    新（正确语义）：basis_bps(T) = (perp_price(T) - index_price(T)) / index_price(T) × 10000 >= -5
+    区别：新方法使用实时 index_price，能正确处理「market 整体下移但 basis 已收敛」的场景。
+
+  - basis_rebound_depth  = (pre_event_index_price - entry_price) / entry_price × 10000
+                           即从入场价到首笔强平时 index 的距离（理论基差止盈空间）
+  - rebound_to_vwap_ms   [DEPRECATED] = 价格首次回到 pre_event_vwap 的延迟
+  - rebound_depth_bps    [DEPRECATED] = (pre_event_vwap - entry) / entry × 10000
 
 所有 bps = 10000 × ΔP / P_entry，正值 = 价格上涨（有利），负值 = 价格下跌（不利）。
 
-主接口：compute_outcome(episode_id, end_event_ts, entry_price, pre_event_vwap, trades)
-  - trades 为 [(trade_ts, price), ...] 按 trade_ts 升序排列
-  - trades 应由调用方预先过滤为 end_event_ts 到 end_event_ts+15min 的成交
+主接口：compute_outcome(...)
+  - trades       = [(trade_ts, price), ...] 升序，end_event_ts 之后 15 分钟的成交
+  - index_prices = [(event_ts, index_price), ...] 升序，同时间段的 raw_mark_prices 数据
+                   用于每个时间点的实时 basis 计算；为 [] 时回退到旧近似（降级兼容）
+  - pre_event_index_price 为首笔强平时的现货指数价格（用于 basis_rebound_depth 计算）
 """
 from __future__ import annotations
 
@@ -52,9 +62,40 @@ class EpisodeOutcome:
     rebound_to_vwap_ms:  int   | None   # [DEPRECATED] 价格首次 >= pre_event_vwap 的延迟
     rebound_depth_bps:   float | None   # [DEPRECATED] 从 entry 到 pre_event_vwap 的距离
     trade_count_0_15m:   int            # 15 分钟内成交总笔数
-    # 微观结构重构新增
-    rebound_to_basis_zero_ms: int   | None  # 基差首次回归 0 附近的延迟 (ms)
-    basis_rebound_depth:      float | None  # index_price 与 entry_price 的距离 (bps)
+    # 微观结构重构新增（主要基差指标）
+    rebound_to_basis_zero_ms: int   | None  # 【主要】基差首次回归 0 的延迟 (ms)
+    basis_rebound_depth:      float | None  # 【主要】index_price 与 entry_price 的距离 (bps)
+
+
+_INDEX_ALIGN_MAX_MS = 2_000   # 时间对齐容忍上界：index_price 最多落后 trade 2000ms
+_BASIS_ZERO_BPS     = -5.0    # 基差回归阈值：basis_bps >= -5 视为"回归到 0"
+
+
+def _find_index_price_at(
+    ts: int,
+    index_prices: list[tuple[int, float]],
+) -> float | None:
+    """
+    在 index_prices 中找到 ts 时刻对应的 index_price。
+
+    规则（向前追溯）：
+      - 找最近一条 event_ts <= ts 的记录
+      - 若 ts - event_ts > _INDEX_ALIGN_MAX_MS，视为数据过旧，返回 None
+      - index_prices 必须按 event_ts 升序
+    """
+    result: float | None = None
+    result_ts: int = -1
+    for idx_ts, idx_price in index_prices:
+        if idx_ts <= ts:
+            result    = idx_price
+            result_ts = idx_ts
+        else:
+            break  # 已超过 ts，后续无需遍历
+    if result is None:
+        return None
+    if ts - result_ts > _INDEX_ALIGN_MAX_MS:
+        return None  # 数据过旧
+    return result
 
 
 def compute_outcome(
@@ -64,16 +105,20 @@ def compute_outcome(
     pre_event_vwap: float | None,
     trades:         list[tuple[int, float]],  # [(trade_ts, price), ...] 升序
     pre_event_index_price: float | None = None,
+    index_prices:   list[tuple[int, float]] | None = None,  # [(event_ts, index_price), ...] 升序
 ) -> EpisodeOutcome:
     """
     从 episode 结束后 15 分钟内的成交序列计算 outcome。
 
     参数：
-        episode_id:     episode 唯一标识
-        end_event_ts:   episode 末笔事件的交易所时间戳 (ms)
-        entry_price:    理论入场价（episode 期间 min_mid_price）
-        pre_event_vwap: 事前 VWAP（首笔强平时的 VWAP）
-        trades:         [(trade_ts, price), ...] — end_event_ts 之后 15 分钟的成交，升序
+        episode_id:            episode 唯一标识
+        end_event_ts:          episode 末笔事件的交易所时间戳 (ms)
+        entry_price:           理论入场价（episode 期间 min_mid_price）
+        pre_event_vwap:        事前 VWAP（首笔强平时的 VWAP）[DEPRECATED]
+        trades:                [(trade_ts, price), ...] — end_event_ts 之后 15 分钟的成交，升序
+        pre_event_index_price: 首笔强平时的 index_price（用于 basis_rebound_depth）
+        index_prices:          [(event_ts, index_price), ...] 升序，用于实时 basis 计算
+                               None 或 [] 时降级为旧近似（perp >= pre_event_index_price）
     """
     n = len(trades)
 
@@ -121,14 +166,39 @@ def compute_outcome(
     if entry_price is not None and entry_price > 0 and pre_event_vwap is not None:
         rebound_depth = round((pre_event_vwap - entry_price) / entry_price * 10_000, 1)
 
-    # 微观结构重构：基差回归带来的反弹距离和延迟
+    # ── basis_rebound_depth：理论止盈空间（不依赖实时 index，用首笔 index 即可）────────
     basis_rebound: float | None = None
     if entry_price is not None and entry_price > 0 and pre_event_index_price is not None:
         basis_rebound = round((pre_event_index_price - entry_price) / entry_price * 10_000, 1)
 
-    # 基差回归到 0 的延迟（价格首次 >= pre_event_index_price）
+    # ── rebound_to_basis_zero_ms：基差真正收敛的延迟（Phase 4 核心修复）────────────────
+    #
+    # 【旧逻辑（错误近似）】：perp_price >= pre_event_index_price（固定价格阈值）
+    #   问题：市场整体下移时，perp 和 index 同时下跌，basis 已收敛，
+    #         但 perp_price 可能永远不会回到 pre_event_index_price，导致误判"未修复"。
+    #
+    # 【新逻辑（正确语义）】：
+    #   对每笔成交 trade(T)，找最近一条 index_price（向前追溯，最多 2000ms）
+    #   计算 basis_bps(T) = (perp_price(T) - index_price(T)) / index_price(T) × 10000
+    #   首个 basis_bps(T) >= _BASIS_ZERO_BPS（-5 bps）的时间点即为修复时刻
+    #
+    # 【降级兼容】：若 index_prices 为空（历史 episode 无 raw_mark_prices 数据），
+    #   回退到旧的固定价格近似，并标记（通过 None 结果可区分）
     basis_zero_ms: int | None = None
-    if pre_event_index_price is not None:
+    _idx_prices = index_prices or []
+
+    if _idx_prices:
+        # 新路径：实时 basis 计算（最准确）
+        for ts, p in trades_0_15m:
+            cur_index = _find_index_price_at(ts, _idx_prices)
+            if cur_index is None or cur_index <= 0:
+                continue  # index 数据不可用，跳过此点
+            cur_basis = (p - cur_index) / cur_index * 10_000
+            if cur_basis >= _BASIS_ZERO_BPS:
+                basis_zero_ms = ts - end_event_ts
+                break
+    elif pre_event_index_price is not None:
+        # 降级路径：无实时 index 时，用固定价格近似（历史兼容，语义不精确）
         for ts, p in trades_0_15m:
             if p >= pre_event_index_price:
                 basis_zero_ms = ts - end_event_ts

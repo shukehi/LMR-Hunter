@@ -30,7 +30,7 @@ import aiosqlite
 
 from src.features.episode import LiquidationEpisode
 from src.features.outcome import EpisodeOutcome
-from src.gateway.models import Depth, Kline, Liquidation, Trade
+from src.gateway.models import Depth, Kline, Liquidation, MarkPrice, Trade
 from src.utils.logger import setup_logger
 
 logger = setup_logger("storage.writer")
@@ -80,6 +80,7 @@ class DatabaseWriter:
             "trades":       0,
             "klines":       0,
             "depths":       0,
+            "mark_prices":  0,   # raw_mark_prices 写入计数（basis 可审计性指标）
             "signals":      0,
             "episodes":     0,
             "outcomes":     0,
@@ -122,6 +123,34 @@ class DatabaseWriter:
         """True = 没有任何真实样本损坏。Shadow Mode 前置门槛之一。"""
         i = self._integrity
         return i["overflow_dropped"] == 0 and i["isolated"] == 0 and i["lost"] == 0
+
+    # ── 标记价格 / 现货指数（basis_bps 可审计的源头事实）────────────────────────────
+
+    async def write_mark_price(self, mp: MarkPrice) -> None:
+        """
+        持久化 markPrice@1s 事件。
+
+        设计约束：
+          - 每秒 1 条，写入量约 86,400 条/天，对 SQLite 无压力，直接写入不批量
+          - basis_bps 为预计算冗余列，避免每次查询都做实时计算
+          - 不做降采样：原始 1s 粒度对 outcome 计算的时间对齐至关重要
+        """
+        basis_bps = (mp.mark_price - mp.index_price) / mp.index_price * 10_000
+        try:
+            await self._conn.execute(
+                """
+                INSERT INTO raw_mark_prices
+                    (recv_ts, event_ts, symbol, mark_price, index_price, basis_bps)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (mp.recv_ts, mp.event_ts, mp.symbol,
+                 mp.mark_price, mp.index_price, basis_bps),
+            )
+            await self._conn.commit()
+            self._write_counts["mark_prices"] += 1
+        except Exception as e:
+            self._write_counts["errors"] += 1
+            logger.error("写入标记价格失败: %s | event_ts=%d", e, mp.event_ts)
 
     # ── 强平事件 ──────────────────────────────────────────────────────────────
 
@@ -545,6 +574,27 @@ class DatabaseWriter:
             (cutoff,),
         )).fetchall()
         return [dict(r) for r in rows]
+
+    async def get_mark_prices_for_outcome(
+        self, symbol: str, start_ts: int, end_ts: int
+    ) -> list[tuple[int, float]]:
+        """
+        返回 outcome 观测窗口内的 index_price 时间序列 [(event_ts, index_price), ...] 升序。
+
+        用于 Phase 4 Outcome 语义修复：
+          compute_outcome() 需要实时 index_price 序列，才能计算真正的
+          basis_bps(T) = (perp_price(T) - index_price(T)) / index_price(T) × 10000
+          而非用固定的 pre_event_index_price 做近似。
+        """
+        rows = await (await self._conn.execute(
+            """
+            SELECT event_ts, index_price FROM raw_mark_prices
+            WHERE  symbol = ? AND event_ts >= ? AND event_ts <= ?
+            ORDER  BY event_ts
+            """,
+            (symbol, start_ts, end_ts),
+        )).fetchall()
+        return [(r[0], r[1]) for r in rows]
 
     async def get_trades_after_episode(
         self, symbol: str, start_ts: int, end_ts: int

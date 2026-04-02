@@ -17,9 +17,9 @@
     - entry_price = episode.min_mid_price（episode 期间盘口最低价，理论做多入场参考价）
     - 实际挂单价 fill_price = entry_price × (1 - entry_offset_bps / 10000)
     - 成交判定：mae_bps <= -entry_offset_bps（0-5min 内价格触及或低于挂单价）
-    - 保守出场优先级：硬止损 > 止盈（回到 VWAP）> 时间止损（5min）
+    - 保守出场优先级：硬止损 > 止盈（回到锚点）> 时间止损（5min）
     - 硬止损触发判定：mae_bps <= -(entry_offset_bps + hard_stop_bps)（近似，bps 量级小）
-    - 止盈触发判定：rebound_to_vwap_ms is not None and <= time_stop_sec * 1000
+    - 止盈触发判定：优先 rebound_to_basis_zero_ms，回退 rebound_to_vwap_ms
     - 时间止损：price_at_5m 作为平仓价（5min 强制出场）
 """
 from __future__ import annotations
@@ -95,9 +95,15 @@ class EpisodeRow:
     rebound_depth_bps:     Optional[float]
     price_at_5m:           Optional[float]
     entry_price:           Optional[float]   # = outcome.entry_price（= min_mid_price）
-    price_at_episode_end:  Optional[float]   # episode 结束后首笔成交价（可下单最早真实价格）
+    price_at_episode_end:  Optional[float]   # episode 结束后首笔成交价
     trade_count_0_15m:     int = 0           # outcome 窗口 15 分钟内的成交笔数
-    session:             str = field(default="")
+    # 微观结构重构新增
+    pre_event_index_price: Optional[float] = None
+    max_basis_bps:         Optional[float] = None
+    max_impact_ratio:      Optional[float] = None
+    rebound_to_basis_zero_ms: Optional[int] = None
+    basis_rebound_depth:   Optional[float] = None
+    session:               str = field(default="")
 
     def __post_init__(self) -> None:
         self.session = classify_session(self.start_event_ts)
@@ -159,8 +165,15 @@ def qualify_episode(ep: EpisodeRow) -> list[str]:
         reasons.append("price_at_5m IS NULL")
     if ep.entry_price is None:
         reasons.append("entry_price IS NULL")
-    if ep.pre_event_vwap is None:
-        reasons.append("pre_event_vwap IS NULL")
+    # Phase 6 修复：准入锚点改为 pre_event_index_price（基差基准），
+    # 不再要求 pre_event_vwap。
+    # 原因：VWAP 是事后计算的统计量，不参与基差因果链；
+    # pre_event_index_price 是首笔强平时的现货公允价值，是 basis 计算的根本输入。
+    # 若 pre_event_index_price 缺失（Phase 1 实施前的历史 episode），
+    # 该样本在基差策略研究中无意义，应被拒绝。
+    if ep.pre_event_index_price is None:
+        reasons.append("pre_event_index_price IS NULL (basis anchor missing)")
+    # pre_event_vwap 字段保留兼容，不再控制准入
     if ep.trade_count_0_15m < QUAL_MIN_TRADE_COUNT:
         reasons.append(
             f"trade_count_0_15m={ep.trade_count_0_15m} < {QUAL_MIN_TRADE_COUNT}"
@@ -171,17 +184,23 @@ def qualify_episode(ep: EpisodeRow) -> list[str]:
         reasons.append(
             f"liq_notional_total={ep.liq_notional_total:.0f} < {QUAL_MIN_NOTIONAL_USD:.0f}"
         )
-    if ep.max_deviation_bps is None or ep.max_deviation_bps > QUAL_MAX_DEVIATION_BPS:
+    # 优先检查 max_basis_bps，回退到 max_deviation_bps
+    if ep.max_basis_bps is not None:
+        if ep.max_basis_bps > -10.0:  # 基差不够深
+            reasons.append(f"max_basis_bps={ep.max_basis_bps} > -10.0")
+    elif ep.max_deviation_bps is None or ep.max_deviation_bps > QUAL_MAX_DEVIATION_BPS:
         reasons.append(
             f"max_deviation_bps={ep.max_deviation_bps} > {QUAL_MAX_DEVIATION_BPS}"
         )
     if ep.liq_count < QUAL_MIN_LIQ_COUNT:
         reasons.append(f"liq_count={ep.liq_count} < {QUAL_MIN_LIQ_COUNT}")
 
-    # ── 2.3 因果结构有效性 ─────────────────────────────────────────────────────
-    if ep.rebound_depth_bps is None or ep.rebound_depth_bps < QUAL_MIN_REBOUND_DEPTH:
+    # ── 2.3 因果结构有效性 ───────────────────────────────────────────────
+    # 优先检查 basis_rebound_depth，回退到 rebound_depth_bps
+    effective_rebound = ep.basis_rebound_depth if ep.basis_rebound_depth is not None else ep.rebound_depth_bps
+    if effective_rebound is None or effective_rebound < QUAL_MIN_REBOUND_DEPTH:
         reasons.append(
-            f"rebound_depth_bps={ep.rebound_depth_bps} < {QUAL_MIN_REBOUND_DEPTH}"
+            f"rebound_depth={effective_rebound} < {QUAL_MIN_REBOUND_DEPTH}"
         )
 
     return reasons
@@ -259,7 +278,12 @@ async def load_episodes(
             o.price_at_5m,
             o.entry_price,
             o.price_at_episode_end,
-            o.trade_count_0_15m
+            o.trade_count_0_15m,
+            e.pre_event_index_price,
+            e.max_basis_bps,
+            e.max_impact_ratio,
+            o.rebound_to_basis_zero_ms,
+            o.basis_rebound_depth
         FROM liquidation_episodes  e
         JOIN episode_outcomes       o ON o.episode_id = e.episode_id
         WHERE e.symbol = 'BTCUSDT'
@@ -288,6 +312,11 @@ async def load_episodes(
             entry_price          = r[13],
             price_at_episode_end = r[14],
             trade_count_0_15m    = r[15],
+            pre_event_index_price = r[16],
+            max_basis_bps         = r[17],
+            max_impact_ratio      = r[18],
+            rebound_to_basis_zero_ms = r[19],
+            basis_rebound_depth   = r[20],
         )
         for r in rows
     ]
@@ -306,7 +335,7 @@ def simulate_trade(ep: EpisodeRow, params: SimParams) -> TradeResult:
 
     出场优先级（保守）：
         1. 硬止损：mae_bps <= -(entry_offset_bps + hard_stop_bps)  → HARD_STOP
-        2. 止盈：rebound_to_vwap_ms is not None and <= time_stop_sec * 1000 → TAKE_PROFIT
+        2. 止盈：优先 rebound_to_basis_zero_ms，回退 rebound_to_vwap_ms，且 <= time_stop_sec * 1000 → TAKE_PROFIT
         3. 时间止损：price_at_5m 作为出场价  → TIME_STOP
 
     净 PnL（bps，相对于 fill_price）：
@@ -345,9 +374,11 @@ def simulate_trade(ep: EpisodeRow, params: SimParams) -> TradeResult:
     hs_triggered = ep.mae_bps <= hs_threshold
 
     time_stop_ms = params.time_stop_sec * 1_000
+    # 止盈判定：优先使用 basis 回归时间，回退到 VWAP 回弹时间
+    rebound_ms = ep.rebound_to_basis_zero_ms if ep.rebound_to_basis_zero_ms is not None else ep.rebound_to_vwap_ms
     tp_triggered = (
-        ep.rebound_to_vwap_ms is not None
-        and ep.rebound_to_vwap_ms <= time_stop_ms
+        rebound_ms is not None
+        and rebound_ms <= time_stop_ms
     )
 
     if hs_triggered:
@@ -368,7 +399,9 @@ def simulate_trade(ep: EpisodeRow, params: SimParams) -> TradeResult:
 
     if tp_triggered:
         # 止盈：Maker 入场 + Maker 止盈
-        if ep.rebound_depth_bps is not None:
+        if ep.basis_rebound_depth is not None:
+            profit_from_fill = ep.basis_rebound_depth + params.entry_offset_bps
+        elif ep.rebound_depth_bps is not None:
             profit_from_fill = ep.rebound_depth_bps + params.entry_offset_bps
         else:
             # rebound_depth_bps 缺失时回退到 MFE
@@ -727,11 +760,16 @@ async def build_report(db: aiosqlite.Connection, since_ts: int = 0) -> str:
     )
 
     # ── 回弹质量分布 ───────────────────────────────────────────────────────────
-    rebounded = [ep for ep in episodes if ep.rebound_to_vwap_ms is not None]
+    # 回弹质量：优先用 basis 指标，回退到 VWAP
+    rebounded_basis = [ep for ep in episodes if ep.rebound_to_basis_zero_ms is not None]
+    rebounded_vwap  = [ep for ep in episodes if ep.rebound_to_vwap_ms is not None]
+    rebounded = rebounded_basis if rebounded_basis else rebounded_vwap
+    use_basis  = len(rebounded_basis) > 0
     rebound_rate = len(rebounded) / len(episodes)
     rebound_latencies = sorted(
-        ep.rebound_to_vwap_ms for ep in rebounded
-        if ep.rebound_to_vwap_ms is not None
+        (ep.rebound_to_basis_zero_ms if use_basis else ep.rebound_to_vwap_ms)
+        for ep in rebounded
+        if (ep.rebound_to_basis_zero_ms if use_basis else ep.rebound_to_vwap_ms) is not None
     )
 
     def _median_ms(ms_list: list[int]) -> str:
@@ -740,9 +778,10 @@ async def build_report(db: aiosqlite.Connection, since_ts: int = 0) -> str:
         m = statistics.median(ms_list)
         return f"{m / 1000:.1f}s"
 
+    anchor_label = "基差回归" if use_basis else "回到 VWAP"
     rebound_lines = [
-        f"  15min 内回到 VWAP 的比例  : {_pct(rebound_rate)}  ({len(rebounded)}/{len(episodes)})",
-        f"  反弹延迟中位数            : {_median_ms(rebound_latencies)}",
+        f"  15min 内{anchor_label}的比例  : {_pct(rebound_rate)}  ({len(rebounded)}/{len(episodes)})",
+        f"  回弹延迟中位数            : {_median_ms(rebound_latencies)}",
     ]
     if rebound_latencies:
         within_1m = sum(1 for ms in rebound_latencies if ms <= 60_000)
@@ -758,10 +797,14 @@ async def build_report(db: aiosqlite.Connection, since_ts: int = 0) -> str:
         ep_sess = [ep for ep in episodes if ep.session == session]
         if not ep_sess:
             continue
-        reb_sess = [ep for ep in ep_sess if ep.rebound_to_vwap_ms is not None]
+        reb_sess = [ep for ep in ep_sess if
+                    (ep.rebound_to_basis_zero_ms if use_basis else ep.rebound_to_vwap_ms) is not None]
         r_rate = len(reb_sess) / len(ep_sess)
-        lats = sorted(ep.rebound_to_vwap_ms for ep in reb_sess
-                      if ep.rebound_to_vwap_ms is not None)
+        lats = sorted(
+            (ep.rebound_to_basis_zero_ms if use_basis else ep.rebound_to_vwap_ms)
+            for ep in reb_sess
+            if (ep.rebound_to_basis_zero_ms if use_basis else ep.rebound_to_vwap_ms) is not None
+        )
         rebound_by_session.append(
             f"    {session}（n={len(ep_sess)}）: "
             f"回弹率 {_pct(r_rate)}  中位延迟 {_median_ms(lats)}"

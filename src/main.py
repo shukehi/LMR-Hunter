@@ -98,9 +98,31 @@ async def on_liquidation(liq: Liquidation) -> None:
         return
 
     snap = _calc.snapshot_at(liq.event_ts)
+
+    # ── Phase 5：四层信号时序评估 ────────────────────────────────────────────
+    # L1 前置预警：过去 180s 内是否出现过 taker_sell 峰值 > 65%
+    #   语义：强平「之前」的被动卖压 spike，领先于 basis 崩溃 ~1-3 分钟
+    #   数据源：aggTrade.is_buyer_maker（不受 forceOrder 1000ms 截断影响）
+    l1_precondition = (
+        snap.taker_sell_peak_180s is not None
+        and snap.taker_sell_peak_180s > 0.65
+    )
+    # L2 核心触发：当前 basis < -30 bps（错误定价已形成，套利窗口已打开）
+    l2_basis_trigger = (
+        snap.basis_bps is not None and snap.basis_bps < -30
+    )
+    # L4 入场确认：买方力量正在回升（套利者/抄底者已开始入场）
+    #   语义：近 10s 买方比例 > 前 10-30s 买方比例 → 正斜率确认修复启动
+    l4_buy_recovery = snap.taker_buy_rising
+
+    # 最终信号：L1 AND L2 AND L4 全部满足
+    # L3（impact_ratio）在 Observe Mode 仅用于质量标注，不作为硬门槛
+    signal_fired = l1_precondition and l2_basis_trigger and l4_buy_recovery
+
     logger.info(
         "[BTC强平] %.0f USDT | 窗口=%.0f | 加速率=%s | Index=%s | 中价=%s | "
-        "基差=%s bps | 冲击率=%s | 盘口延迟=%s",
+        "基差=%s bps | 冲击率=%s | 盘口延迟=%s | "
+        "L1卖压峰值=%s | L4买方回升=%s | 信号=%s",
         liq.notional,
         snap.liq_notional_window,
         f"{snap.liq_accel_ratio:.3f}" if snap.liq_accel_ratio is not None else "N/A",
@@ -109,6 +131,9 @@ async def on_liquidation(liq: Liquidation) -> None:
         f"{snap.basis_bps:.1f}"      if snap.basis_bps is not None else "N/A",
         f"{snap.impact_ratio:.3f}"   if snap.impact_ratio is not None else "N/A",
         f"{snap.depth_staleness_ms}ms" if snap.depth_staleness_ms is not None else "N/A",
+        f"{snap.taker_sell_peak_180s:.3f}" if snap.taker_sell_peak_180s is not None else "无数据",
+        "是" if l4_buy_recovery else "否",
+        "🔥触发" if signal_fired else ("⚡预警" if l1_precondition else "观测中"),
     )
 
     if _episode_builder is not None:
@@ -130,6 +155,14 @@ async def on_liquidation(liq: Liquidation) -> None:
             await _writer.write_episode(completed_ep)
 
     if snap.mid_price is not None:
+        # notes 字段记录 Phase 5 信号层状态，供 Observe Mode 研究分析
+        signal_notes = "|".join(filter(None, [
+            "observe_mode_btc_sell",
+            f"l1={snap.taker_sell_peak_180s:.3f}" if snap.taker_sell_peak_180s is not None else None,
+            "l1_ok" if l1_precondition else None,
+            "l2_ok" if l2_basis_trigger else None,
+            "l4_ok" if l4_buy_recovery else None,
+        ]))
         await _writer.write_signal(
             ts=snap.ts,
             symbol=LIQ_SIGNAL_SYMBOL,
@@ -138,8 +171,8 @@ async def on_liquidation(liq: Liquidation) -> None:
             vwap_15m=snap.vwap_15m,
             mid_price=snap.mid_price,
             deviation_bps=snap.deviation_bps,
-            signal_fired=False,
-            notes="observe_mode_btc_sell",
+            signal_fired=signal_fired,
+            notes=signal_notes,
             index_price=snap.index_price,
             basis_bps=snap.basis_bps,
             bid_depth_usdt=snap.bid_depth_usdt,
@@ -172,7 +205,13 @@ async def on_kline(kline: Kline) -> None:
 
 
 async def on_mark_price(mp: MarkPrice) -> None:
-    """标记价格事件：提取现货指数价格，更新 Feature Engine。"""
+    """标记价格事件：持久化原始数据 + 更新 Feature Engine。
+
+    持久化（write_mark_price）必须先于特征更新（update_index_price）执行：
+    确保即使进程随后崩溃，原始 index_price 也已落库，basis_bps 可事后重建。
+    """
+    if _writer is not None:
+        await _writer.write_mark_price(mp)
     if _calc is not None:
         _calc.update_index_price(mp.index_price, mp.event_ts)
 
@@ -260,6 +299,11 @@ async def stats_reporter(interval: int = 60) -> None:
             s["reconnects"], wc["errors"],
         )
         logger.info(
+            "[写入] 强平=%d | K线=%d | 标记价格=%d | 盘口=%d | episode=%d | outcome=%d",
+            wc["liquidations"], wc["klines"], wc["mark_prices"],
+            wc["depths"], wc["episodes"], wc["outcomes"],
+        )
+        logger.info(
             "[延迟] P50=%.1fms | P95=%.1fms | P99=%.1fms",
             lat["p50"] or 0, lat["p95"] or 0, lat["p99"] or 0,
         )
@@ -314,10 +358,19 @@ async def outcome_processor() -> None:
                     min_age_ms=OUTCOME_WINDOW_MS
                 )
                 for ep in pending:
+                    window_start = ep["end_event_ts"]
+                    window_end   = ep["end_event_ts"] + OUTCOME_WINDOW_MS
                     trades = await _writer.get_trades_after_episode(
                         symbol   = ep["symbol"],
-                        start_ts = ep["end_event_ts"],
-                        end_ts   = ep["end_event_ts"] + OUTCOME_WINDOW_MS,
+                        start_ts = window_start,
+                        end_ts   = window_end,
+                    )
+                    # Phase 4：取 outcome 窗口内的 index_price 时间序列
+                    # 向前扩展 2000ms（_INDEX_ALIGN_MAX_MS），确保窗口起点的成交能找到对应 index
+                    index_prices = await _writer.get_mark_prices_for_outcome(
+                        symbol   = ep["symbol"],
+                        start_ts = window_start - 2_000,
+                        end_ts   = window_end,
                     )
                     outcome = compute_outcome(
                         episode_id     = ep["episode_id"],
@@ -326,6 +379,7 @@ async def outcome_processor() -> None:
                         pre_event_vwap = ep["pre_event_vwap"],
                         trades         = trades,
                         pre_event_index_price = ep.get("pre_event_index_price"),
+                        index_prices   = index_prices,
                     )
                     await _writer.write_episode_outcome(outcome)
         except Exception as e:

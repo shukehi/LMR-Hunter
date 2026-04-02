@@ -84,24 +84,32 @@ def make_episode(
     entry_price:           Optional[float] = 80_000.0,
     price_at_episode_end:  Optional[float] = 80_100.0,
     trade_count_0_15m:     int  = 100,
+    # Phase 6：pre_event_index_price 是新的准入锚点，默认给非 NULL 值
+    # 测试中若要验证「index_price 缺失时被拒」，显式传 None
+    pre_event_index_price: Optional[float] = 82_000.0,
+    max_basis_bps:         Optional[float] = None,
+    basis_rebound_depth:   Optional[float] = None,
 ) -> EpisodeRow:
     return EpisodeRow(
-        episode_id           = episode_id,
-        start_event_ts       = start_event_ts,
-        end_event_ts         = end_event_ts,
-        liq_count            = liq_count,
-        liq_notional_total   = liq_notional_total,
-        min_mid_price        = min_mid_price,
-        pre_event_vwap       = pre_event_vwap,
-        max_deviation_bps    = max_deviation_bps,
-        mae_bps              = mae_bps,
-        mfe_bps              = mfe_bps,
-        rebound_to_vwap_ms   = rebound_to_vwap_ms,
-        rebound_depth_bps    = rebound_depth_bps,
-        price_at_5m          = price_at_5m,
-        entry_price          = entry_price,
-        price_at_episode_end = price_at_episode_end,
-        trade_count_0_15m    = trade_count_0_15m,
+        episode_id            = episode_id,
+        start_event_ts        = start_event_ts,
+        end_event_ts          = end_event_ts,
+        liq_count             = liq_count,
+        liq_notional_total    = liq_notional_total,
+        min_mid_price         = min_mid_price,
+        pre_event_vwap        = pre_event_vwap,
+        max_deviation_bps     = max_deviation_bps,
+        mae_bps               = mae_bps,
+        mfe_bps               = mfe_bps,
+        rebound_to_vwap_ms    = rebound_to_vwap_ms,
+        rebound_depth_bps     = rebound_depth_bps,
+        price_at_5m           = price_at_5m,
+        entry_price           = entry_price,
+        price_at_episode_end  = price_at_episode_end,
+        trade_count_0_15m     = trade_count_0_15m,
+        pre_event_index_price = pre_event_index_price,
+        max_basis_bps         = max_basis_bps,
+        basis_rebound_depth   = basis_rebound_depth,
     )
 
 
@@ -124,6 +132,9 @@ async def make_db() -> aiosqlite.Connection:
             min_mid_price        REAL,
             pre_event_vwap       REAL,
             max_deviation_bps    REAL,
+            pre_event_index_price REAL,
+            max_basis_bps        REAL,
+            max_impact_ratio     REAL,
             created_at           INTEGER NOT NULL
         );
         CREATE TABLE episode_outcomes (
@@ -143,6 +154,8 @@ async def make_db() -> aiosqlite.Connection:
             rebound_to_vwap_ms   INTEGER,
             rebound_depth_bps    REAL,
             trade_count_0_15m    INTEGER NOT NULL DEFAULT 0,
+            rebound_to_basis_zero_ms INTEGER,
+            basis_rebound_depth  REAL,
             computed_at          INTEGER NOT NULL
         );
         CREATE TABLE service_heartbeats (
@@ -181,14 +194,17 @@ async def insert_episode_with_outcome(
         """INSERT INTO liquidation_episodes
            (episode_id, symbol, side, start_event_ts, end_event_ts,
             duration_ms, liq_count, liq_notional_total, liq_peak_window,
-            min_mid_price, pre_event_vwap, max_deviation_bps, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            min_mid_price, pre_event_vwap, max_deviation_bps,
+            pre_event_index_price, max_basis_bps, max_impact_ratio,
+            created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             ep.episode_id, "BTCUSDT", "SELL",
             ep.start_event_ts, ep.end_event_ts,
             ep.end_event_ts - ep.start_event_ts, 3,
             ep.liq_notional_total, ep.liq_notional_total * 0.5,
             ep.min_mid_price, ep.pre_event_vwap, ep.max_deviation_bps,
+            ep.pre_event_index_price, ep.max_basis_bps, ep.max_impact_ratio,
             ep.end_event_ts + 1000,
         ),
     )
@@ -196,12 +212,14 @@ async def insert_episode_with_outcome(
         """INSERT INTO episode_outcomes
            (episode_id, entry_price, price_at_episode_end, price_at_5m,
             mae_bps, mfe_bps, rebound_to_vwap_ms, rebound_depth_bps,
-            trade_count_0_15m, computed_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            trade_count_0_15m, rebound_to_basis_zero_ms, basis_rebound_depth,
+            computed_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             ep.episode_id, ep.entry_price, ep.price_at_episode_end, ep.price_at_5m,
             ep.mae_bps, ep.mfe_bps, ep.rebound_to_vwap_ms, ep.rebound_depth_bps,
-            100, ep.end_event_ts + 900_000,
+            100, ep.rebound_to_basis_zero_ms, ep.basis_rebound_depth,
+            ep.end_event_ts + 900_000,
         ),
     )
     await db.commit()
@@ -613,7 +631,7 @@ class TestQualifyEpisode:
         """rebound_depth_bps < 10 → 被拒绝。"""
         ep = make_episode(rebound_depth_bps=5.0)
         reasons = qualify_episode(ep)
-        assert any("rebound_depth_bps" in r for r in reasons)
+        assert any("rebound_depth" in r for r in reasons)
 
     def test_multiple_failures_all_reported(self):
         """多个字段同时不合格时，所有原因均被记录。"""

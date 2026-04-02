@@ -3,21 +3,31 @@
 
 计算的特征（微观结构重构后）：
   核心特征（基于第一性原理推导链）:
-    1. basis_bps        — (perp_mid_price - index_price) / index_price × 10000
-    2. impact_ratio     — liq_notional_window / bid_depth_usdt
-    3. taker_buy_ratio  — 窗口内主动买成交占比（订单流失衡指标）
+    1. basis_bps             — (perp_mid_price - index_price) / index_price × 10000
+    2. impact_ratio          — liq_notional_window / bid_depth_usdt
+    3. taker_buy_ratio       — 窗口内主动买成交占比（订单流失衡指标）
+    4. taker_sell_peak_180s  — 过去 180s 内 30s 子窗口 taker_sell_ratio 的峰值（前置预警）
+    5. taker_buy_rising      — 近 10s 买方比例 > 前 10-30s 买方比例（入场确认）
 
   辅助特征（保留向后兼容）:
-    4. liq_notional_window  — 滑动时间窗口内的强平总名义价值
-    5. liq_accel_ratio      — 加速率：当前窗口 vs 前一窗口
-    6. vwap_15m             — [DEPRECATED] 基于最近 15 根已收盘 1m K 线的 VWAP
-    7. deviation_bps        — [DEPRECATED] (mid_price - vwap_15m) / vwap_15m × 10000
+    6. liq_notional_window  — 滑动时间窗口内的强平总名义价值
+    7. liq_accel_ratio      — 加速率：当前窗口 vs 前一窗口
+    8. vwap_15m             — [DEPRECATED] 基于最近 15 根已收盘 1m K 线的 VWAP
+    9. deviation_bps        — [DEPRECATED] (mid_price - vwap_15m) / vwap_15m × 10000
 
 设计原则：
   - 所有窗口计算以 exchange event_ts 为锚点
   - mid_price / index_price / bid_depth 缓存均携带时间戳，计算前校验新鲜度
-  - 若数据距事件时间超过 MAX_STALE_MS，对应特征标记为不可用（返回 None）
+  - 各特征有独立 freshness 阈值（MAX_INDEX/MID/DEPTH_STALE_MS），不共用单一上界
+  - bid_depth 额外施加因果方向约束：depth.event_ts 必须 <= liq.event_ts
+  - 若数据超出对应阈值，该特征标记为不可用（返回 None）
   - snapshot_at(event_ts_ms) 是主接口
+
+Phase 5 信号时序设计：
+  trade_flow 保留 _TAKER_FLOW_MAX_LOOKBACK_MS（180s）的历史数据，
+  供 taker_sell_peak_in_window 检测前置卖压 spike。
+  taker_buy_ratio 仍使用 liq_window_ms（5s）窗口，
+  taker_buy_rising 使用 [0-10s] vs [10-30s] 的比较。
 """
 from __future__ import annotations
 
@@ -27,8 +37,41 @@ from dataclasses import dataclass
 
 from src.gateway.models import Kline, Liquidation, Trade
 
-# 数据"新鲜度"阈值 (ms)
-MAX_STALE_MS: int = 5_000  # 5 秒
+# ── 数据新鲜度阈值（各特征独立，对齐其物理因果语义）──────────────────────────────────
+#
+# 设计原则（第一性原理）：
+#   每个特征的 freshness 预算由其数据源的推送频率和因果语义共同决定，
+#   不允许用统一阈值掩盖不同特征的不同时效要求。
+#
+# MAX_INDEX_STALE_MS = 2000ms
+#   依据：markPrice@1s 流最大间隔 1s + 1s 网络/处理裕量
+#   因果语义：index_price 表示当前公允价值，2s 内仍可信
+#
+# MAX_MID_STALE_MS = 500ms
+#   依据：depth 更新频率 ~100ms，mid_price 应近实时
+#   因果语义：mid_price 用于盘口基差计算，允许 500ms 误差
+#
+# MAX_DEPTH_STALE_MS = 1500ms（过渡方案）
+#   依据：当前 depth stream 1s 降采样，1s + 500ms 处理裕量
+#   因果语义：impact_ratio 要求使用强平「之前」的深度
+#   长期目标：depth stream 升频至 ≤100ms 后，此值收紧至 100ms
+#   注意：此阈值仅限制「多旧的深度可用」，不改变「必须早于强平」的因果约束
+#
+# MAX_STALE_MS 保留为向后兼容别名，等于最宽松的 MAX_INDEX_STALE_MS
+MAX_INDEX_STALE_MS: int = 2_000   # index_price：2s（markPrice@1s 流）
+MAX_MID_STALE_MS:   int = 500     # mid_price：500ms（盘口近实时）
+MAX_DEPTH_STALE_MS: int = 1_500   # bid_depth：1.5s（过渡方案，待 depth 升频后收紧至 100ms）
+MAX_STALE_MS:       int = MAX_INDEX_STALE_MS  # 向后兼容别名，勿用于新代码
+
+# ── Phase 5：信号时序 — trade_flow 保留窗口配置 ───────────────────────────────────
+#
+# taker_sell_peak_in_window 需要回溯 180s（前置预警窗口），
+# 因此 trade_flow 必须至少保留 180s 的数据。
+# cleanup 不再在 _taker_buy_ratio 内部执行，改为在 snapshot_at 顶部统一清理。
+_TAKER_FLOW_MAX_LOOKBACK_MS: int = 180_000  # trade_flow 最大保留时间（决定内存上界）
+_TAKER_SELL_SUBWIN_MS:       int = 30_000   # taker_sell_peak 子窗口大小（30s）
+_TAKER_BUY_RECENT_MS:        int = 10_000   # taker_buy_rising 近期窗口（0-10s）
+_TAKER_BUY_PRIOR_MS:         int = 30_000   # taker_buy_rising 对比窗口（10-30s）
 
 
 @dataclass(slots=True)
@@ -56,6 +99,14 @@ class FeatureSnapshot:
     depth_event_ts:       int | None    # 最近一次 depth 更新的交易所时间戳 (ms)
     depth_staleness_ms:   int | None    # 盘口相对锚点的时间差
 
+    # ── Phase 5：信号时序特征 ──────────────────────────────────────────────────
+    taker_sell_peak_180s: float | None  # 前置预警：过去 180s 内 30s 子窗口 taker_sell_ratio 峰值
+    #   None = 180s 内无任何成交数据（冷启动或数据断流）
+    #   用于 L1：`taker_sell_peak_180s > 0.65` → 前置卖压已出现
+    taker_buy_rising:     bool          # 入场确认：近 10s 买方比例 > 前 10-30s 买方比例
+    #   False = 买方力量未回升（强平仍在持续 or 数据不足）
+    #   用于 L4：`taker_buy_rising=True` → 套利/抄底资金正在入场
+
     # ── [DEPRECATED] VWAP 相关（保留向后兼容，不再用于信号判断）──────────────
     vwap_15m:             float | None  # VWAP（None = K 线不足 15 根）
     deviation_bps:        float | None  # VWAP 偏离率
@@ -73,13 +124,13 @@ class FeatureSnapshot:
 
     @property
     def is_depth_fresh(self) -> bool:
-        """True = 盘口足够新鲜，基差和冲击比例可信。"""
-        return self.depth_staleness_ms is not None and self.depth_staleness_ms <= MAX_STALE_MS
+        """True = 盘口中价足够新鲜（≤ MAX_MID_STALE_MS）。"""
+        return self.depth_staleness_ms is not None and self.depth_staleness_ms <= MAX_MID_STALE_MS
 
     @property
     def is_index_fresh(self) -> bool:
-        """True = 指数价格足够新鲜，基差可信。"""
-        return self.index_staleness_ms is not None and self.index_staleness_ms <= MAX_STALE_MS
+        """True = 指数价格足够新鲜（≤ MAX_INDEX_STALE_MS），基差可信。"""
+        return self.index_staleness_ms is not None and self.index_staleness_ms <= MAX_INDEX_STALE_MS
 
     @property
     def has_taker_buy_confirmation(self) -> bool:
@@ -201,7 +252,24 @@ class FeatureCalculator:
 
         这是主接口。传入强平事件的 event_ts_ms，
         所有时间窗口均以此锚点为基准，消除链路延迟的影响。
+
+        时间因果约束（第一性原理）：
+          - mid_price：≤ MAX_MID_STALE_MS (500ms) 内的快照
+          - index_price：≤ MAX_INDEX_STALE_MS (2000ms) 内（markPrice@1s 推送频率）
+          - bid_depth：双重约束：
+              1. depth.event_ts <= liq.event_ts（因果方向，绝对约束）
+              2. liq.event_ts - depth.event_ts <= MAX_DEPTH_STALE_MS (1500ms，过渡方案)
+          - Taker Buy（pre-event）：[event_ts - window, event_ts] 窗口，
+            反映强平发生时的买卖格局，不含事后修复资金。
+            注意：这与策略文档 §7.4 描述的「事后确认」语义不同：
+              pre-event Taker Buy  → 记录研究样本中「强平前市场状态」
+              post-event Taker Buy → 未来 Shadow Mode 下单时的入场时机确认
+            Observe Mode 仅需前者用于统计研究。
         """
+        # 统一清理 trade_flow（保留最近 _TAKER_FLOW_MAX_LOOKBACK_MS=180s 数据）
+        # 必须在所有 taker_* 方法调用前执行，确保一致的窗口边界
+        self._cleanup_trade_flow(event_ts_ms)
+
         liq_current, liq_prev = self._liquidation_windows(event_ts_ms)
         accel_ratio = self._acceleration_ratio(liq_current, liq_prev)
         vwap = self._vwap()
@@ -212,7 +280,7 @@ class FeatureCalculator:
 
         if self._mid_price is not None and self._mid_price_ts is not None:
             depth_staleness_ms = abs(event_ts_ms - self._mid_price_ts)
-            effective_mid = self._mid_price if depth_staleness_ms <= MAX_STALE_MS else None
+            effective_mid = self._mid_price if depth_staleness_ms <= MAX_MID_STALE_MS else None
         elif self._mid_price is not None:
             effective_mid = self._mid_price
 
@@ -222,22 +290,42 @@ class FeatureCalculator:
 
         if self._index_price is not None and self._index_price_ts is not None:
             index_staleness_ms = abs(event_ts_ms - self._index_price_ts)
-            effective_index = self._index_price if index_staleness_ms <= MAX_STALE_MS else None
+            effective_index = self._index_price if index_staleness_ms <= MAX_INDEX_STALE_MS else None
 
         # ── 基差 (Basis) ─────────────────────────────────────────────────────
         basis_bps = self._basis_bps(effective_mid, effective_index)
 
         # ── 买盘深度 & 冲击比例 ──────────────────────────────────────────────
+        # ── 买盘深度新鲜度（双重约束）────────────────────────────────────────────
+        # 约束 1【因果方向】：bid_depth 必须来自强平「之前」（depth.event_ts <= liq.event_ts）
+        #   原因：强平击穿买盘后，做市商数百毫秒内重新挂单，盘口迅速修复。
+        #   若取强平后的深度，impact_ratio 分母偏大 → 冲击被系统性低估。
+        #
+        # 约束 2【时效性】：depth 距强平不超过 MAX_DEPTH_STALE_MS（当前 1500ms）
+        #   原因：过旧的深度反映的是更早时刻的市场状态，与强平瞬间的流动性不符。
+        #   长期目标：depth stream 升频至 ≤100ms 后，此值收紧至 100ms。
+        #
+        # 两个约束均须同时满足，缺一则 impact_ratio = None。
         effective_bid_depth: float | None = None
         if self._bid_depth_usdt is not None and self._bid_depth_usdt_ts is not None:
-            bid_staleness = abs(event_ts_ms - self._bid_depth_usdt_ts)
-            if bid_staleness <= MAX_STALE_MS:
-                effective_bid_depth = self._bid_depth_usdt
+            # 约束 1：严格因果，只接受强平前（含同时刻）的深度快照
+            if self._bid_depth_usdt_ts <= event_ts_ms:
+                bid_staleness = event_ts_ms - self._bid_depth_usdt_ts
+                # 约束 2：时效性，使用 MAX_DEPTH_STALE_MS（独立于 mid/index 阈值）
+                if bid_staleness <= MAX_DEPTH_STALE_MS:
+                    effective_bid_depth = self._bid_depth_usdt
+            # 若 depth.event_ts > liq.event_ts：深度来自强平后，丢弃（因果违反）
 
         impact_ratio = self._impact_ratio(liq_current, effective_bid_depth)
 
-        # ── Taker Buy 占比 ───────────────────────────────────────────────────
+        # ── Taker Buy 占比（事前窗口，liq_window_ms=5s）────────────────────────
         taker_buy_ratio = self._taker_buy_ratio(event_ts_ms)
+
+        # ── Phase 5：信号时序特征 ─────────────────────────────────────────────
+        # L1 前置预警：过去 180s 内 30s 子窗口的 taker_sell_ratio 峰值
+        taker_sell_peak = self._taker_sell_peak_in_window(event_ts_ms)
+        # L4 入场确认：买方力量是否正在回升（近 10s vs 前 10-30s）
+        taker_buy_rising = self._taker_buy_ratio_rising(event_ts_ms)
 
         # ── [DEPRECATED] VWAP 偏离率 ─────────────────────────────────────────
         deviation = self._deviation(effective_mid, vwap)
@@ -258,6 +346,9 @@ class FeatureCalculator:
             mid_price=effective_mid,
             depth_event_ts=self._mid_price_ts,
             depth_staleness_ms=depth_staleness_ms,
+            # Phase 5 信号时序
+            taker_sell_peak_180s=taker_sell_peak,
+            taker_buy_rising=taker_buy_rising,
             # DEPRECATED VWAP
             vwap_15m=vwap,
             deviation_bps=deviation,
@@ -333,18 +424,35 @@ class FeatureCalculator:
             return 0.0
         return round(liq_notional / bid_depth, 3)
 
-    def _taker_buy_ratio(self, now_ms: int) -> float | None:
+    def _cleanup_trade_flow(self, now_ms: int) -> None:
         """
-        计算滑动窗口内的 Taker Buy 成交额占比。
+        清理 trade_flow 中超过最大观测窗口的历史数据。
 
-        用于微观衰减确认：必须看到主动买盘入场（而非仅强平暂停），
-        才认为修复动力已出现。
+        统一在 snapshot_at 顶部调用，而非分散在各计算方法内部。
+        保留 _TAKER_FLOW_MAX_LOOKBACK_MS（180s）的数据，
+        确保 taker_sell_peak_in_window 能访问到足够长的历史。
         """
-        cutoff = now_ms - self._liq_window_ms
-
-        # 清理过期数据
+        cutoff = now_ms - _TAKER_FLOW_MAX_LOOKBACK_MS
         while self._trade_flow and self._trade_flow[0][0] < cutoff:
             self._trade_flow.popleft()
+
+    def _taker_buy_ratio(self, now_ms: int) -> float | None:
+        """
+        计算滑动窗口 [now_ms - liq_window_ms, now_ms] 内的 Taker Buy 成交额占比。
+
+        语义说明（Observe Mode）：
+          - 当 now_ms = liq.event_ts 时，此窗口反映强平「发生时」的买卖格局
+            （即强平前 liq_window_sec 秒内主动买盘占比）。
+          - 这是一个「预确认」指标：高 taker_buy_ratio 说明即便在强平时，
+            市场仍有主动买盘抵抗（套利者已提前入场 or 抄底盘积极）。
+          - 「事后验证」语义（强平发生后主动买盘开始入场）需使用
+            post-event 窗口 [liq.event_ts, liq.event_ts + X]，
+            该路径将在 Shadow Mode 入场时机确认时实现。
+
+        注意：数据清理由 snapshot_at 顶部的 _cleanup_trade_flow 统一负责，
+        此方法只做窗口内过滤，不再主动 popleft。
+        """
+        cutoff = now_ms - self._liq_window_ms
 
         if not self._trade_flow:
             return None
@@ -360,6 +468,92 @@ class FeatureCalculator:
         if total_all <= 0:
             return None
         return round(total_buy / total_all, 3)
+
+    def _taker_sell_peak_in_window(self, now_ms: int) -> float | None:
+        """
+        在过去 _TAKER_FLOW_MAX_LOOKBACK_MS（180s）内，以 _TAKER_SELL_SUBWIN_MS（30s）
+        为子窗口，计算每个子窗口的 taker_sell_ratio，返回所有子窗口中的最大值（峰值）。
+
+        物理语义（Phase 5 L1 前置预警）：
+          - 被动市价卖单（强平产生）在强平事件「之前」就已经开始涌现（T-3min 内）
+          - 捕捉"过去 3 分钟内曾经出现过大卖压"，而不要求卖压此刻仍在持续
+          - 高峰值（> 0.65）说明近期有异常被动卖压，是强平级联的前兆
+
+        返回：
+          float  — 所有子窗口中 taker_sell_ratio 的最大值（0.0 到 1.0）
+          None   — 整个 lookback 窗口内无任何成交数据（冷启动 or 数据断流）
+
+        子窗口划分（固定步长，不滑动）：
+          以 now_ms 为终点，向前按 30s 切分 6 个桶：
+          [now-180s, now-150s], [now-150s, now-120s], ..., [now-30s, now]
+
+        子窗口成交量不足时跳过（不影响其他窗口的峰值计算）。
+        """
+        lookback_start = now_ms - _TAKER_FLOW_MAX_LOOKBACK_MS
+        n_subwindows   = _TAKER_FLOW_MAX_LOOKBACK_MS // _TAKER_SELL_SUBWIN_MS  # = 6
+
+        peak: float | None = None
+        for i in range(n_subwindows):
+            win_start = lookback_start + i * _TAKER_SELL_SUBWIN_MS
+            win_end   = win_start + _TAKER_SELL_SUBWIN_MS
+
+            total_notional = 0.0
+            sell_notional  = 0.0
+            for ts, notional, is_buy in self._trade_flow:
+                if win_start <= ts < win_end:
+                    total_notional += notional
+                    if not is_buy:  # is_buy=False → Taker Sell
+                        sell_notional += notional
+
+            if total_notional <= 0:
+                continue  # 此子窗口无成交，跳过（不计入峰值）
+
+            ratio = sell_notional / total_notional
+            if peak is None or ratio > peak:
+                peak = ratio
+
+        return peak
+
+    def _taker_buy_ratio_rising(self, now_ms: int) -> bool:
+        """
+        买方力量回升确认（Phase 5 L4 入场确认）。
+
+        物理语义：
+          - 强平冲击最激烈时，taker_sell 主导（卖压 >> 买压）
+          - 强平消退、套利者/抄底者开始入场时，taker_buy 逐渐回升
+          - 「买方比例正斜率」是套利修复已经启动的信号，而不仅仅是「有买单」
+
+        算法：
+          recent_avg  = [now-10s, now] 内的 taker_buy_ratio（近期买压）
+          prior_avg   = [now-30s, now-10s] 内的 taker_buy_ratio（基准买压）
+          返回：recent_avg > prior_avg
+
+        返回 False 的情形：
+          - 任一窗口内无成交数据（不够数据 → 保守处理，不确认入场）
+          - recent_avg <= prior_avg（买压未回升或继续下降）
+        """
+        recent_cutoff = now_ms - _TAKER_BUY_RECENT_MS   # now - 10s
+        prior_cutoff  = now_ms - _TAKER_BUY_PRIOR_MS    # now - 30s
+
+        recent_total = recent_buy = 0.0
+        prior_total  = prior_buy  = 0.0
+
+        for ts, notional, is_buy in self._trade_flow:
+            if ts >= recent_cutoff:          # [now-10s, now]
+                recent_total += notional
+                if is_buy:
+                    recent_buy += notional
+            elif ts >= prior_cutoff:         # [now-30s, now-10s]
+                prior_total += notional
+                if is_buy:
+                    prior_buy += notional
+
+        if recent_total <= 0 or prior_total <= 0:
+            return False  # 数据不足 → 不确认入场
+
+        recent_ratio = recent_buy / recent_total
+        prior_ratio  = prior_buy  / prior_total
+        return recent_ratio > prior_ratio
 
     def _vwap(self) -> float | None:
         """
